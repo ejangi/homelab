@@ -1,0 +1,22 @@
+# This is where you specify the hostname, equivalent to Nginx's server_name.
+# Caddy automatically serves this on port 80 (HTTP) and 443 (HTTPS)
+# and obtains a certificate.
+
+ejangi-nix.bobtail-morpho.ts.net, localhost:8080 {
+    # CRITICAL: Disable the Tailscale TLS provider
+    tls internal
+    log
+
+    # 1. N8N Proxy Block: Match requests starting with /n8n/
+    handle /n8n* {
+        # CRITICAL: Strip the /n8n prefix from the URI before forwarding
+        uri strip_prefix /n8n
+
+        reverse_proxy n8n:5678 {
+            header_up Upgrade {header.Upgrade}
+            header_up Connection {header.Connection}
+            header_up Host {host}
+        }
+    }
+
+}

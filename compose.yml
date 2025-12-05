@@ -1,0 +1,124 @@
+services:
+  # 1. N8N SERVICE
+  n8n:
+    image: n8nio/n8n
+    container_name: n8n
+    restart: unless-stopped
+    sysctls:
+      # CRITICAL FIX: Keep IPv6 disabled to avoid resolution confusion
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
+      - net.ipv6.conf.lo.disable_ipv6=1
+    environment:
+      # Database Connection Settings - SWITCHED TO POSTGRES
+      - DB_TYPE=postgres
+      - DB_POSTGRES_HOST=postgres
+      - DB_POSTGRES_PORT=5432
+      - DB_POSTGRES_DATABASE=${POSTGRES_DB}
+      - DB_POSTGRES_USER=${POSTGRES_USER}
+      - DB_POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      # Network/Host Settings - UPDATED FOR CADDY/HTTPS
+      - N8N_LISTEN_ADDRESS=${N8N_LISTEN_ADDRESS}
+      - N8N_PATH=${N8N_PATH}
+      # The WEBHOOK_URL must be HTTPS now that Caddy handles security
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      - N8N_HOST=${N8N_HOST}
+      # CRITICAL: Change N8N_PROTOCOL to https
+      - N8N_PROTOCOL=${N8N_PROTOCOL}
+      # Security & Timezone
+      - N8N_BASIC_AUTH_ACTIVE=${N8N_BASIC_AUTH_ACTIVE}
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      # Change N8N_SECURE_COOKIE to true as we are using HTTPS
+      - N8N_SECURE_COOKIE=${N8N_SECURE_COOKIE}
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
+      - TZ=${TZ}
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      - postgres
+    networks:
+      - n8n_backend
+
+  # 2. POSTGRES SERVICE
+  postgres:
+    image: postgres:15-alpine
+    container_name: n8n_postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # Note: We use $$ to escape the $ sign, allowing the shell to access the environment variable
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - n8n_backend
+
+  # 3. CADDY SERVICE (Reverse Proxy & Automatic HTTPS)
+  caddy:
+    image: caddy:latest
+    container_name: n8n_caddy
+    restart: always
+    ports:
+      # Expose standard web ports
+      - "80:80"
+      - "443:443"
+      - "8080:8080"
+    volumes:
+      # CRITICAL: Mount the local Caddyfile into the container's config path
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Volume for Caddy's data (including SSL certificates)
+      - caddy_data:/data
+    depends_on:
+      - n8n
+    networks:
+      - n8n_backend
+
+  # 4. POSTGRES BACKUP SERVICE
+  postgres_backup:
+    image: postgres:15-alpine # Use the same image to ensure compatibility with pg_dump
+    container_name: n8n_postgres_backup
+    restart: "no"
+    environment:
+      # Database Connection Details - Variables are set for n8n/postgres compatibility
+      - PGHOST=postgres
+      - PGPORT=5432
+      - PGDATABASE=${POSTGRES_DB}
+      - PGUSER=${POSTGRES_USER}
+      - PGPASSWORD=${POSTGRES_PASSWORD}
+      # Backup settings
+      - BACKUP_DIR=/backups
+    volumes:
+      # Mount a local directory for backups (bind mount)
+      - ./backups:/backups
+      # CRITICAL: Mount a script that performs the actual backup and scheduling
+      - ./scripts/backup.sh:/usr/local/bin/backup.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy # Ensure postgres is up and ready
+    networks:
+      - n8n_backend
+    command:
+      ["sh", "-c", "while true; do /usr/local/bin/backup.sh; sleep 86400; done"]
+
+# Volume & Network Definition
+volumes:
+  n8n_data:
+  postgres_data:
+  caddy_data: # Define the new Caddy data volume
+
+networks:
+  n8n_backend:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: ${NETWORK_SUBNET}
