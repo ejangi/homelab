@@ -1,4 +1,4 @@
-# n8n Local Homeserver
+# n8n Local Homelab
 
 > Uses [n8n](https://github.com/n8n-io/n8n), serves using https via [caddy](https://github.com/caddyserver/caddy) and do 24 hour backups.
 
