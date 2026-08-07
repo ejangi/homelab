@@ -11,12 +11,12 @@ services:
       - net.ipv6.conf.lo.disable_ipv6=1
     environment:
       # Database Connection Settings - SWITCHED TO POSTGRES
-      - DB_TYPE=postgres
-      - DB_POSTGRES_HOST=postgres
-      - DB_POSTGRES_PORT=5432
-      - DB_POSTGRES_DATABASE=${POSTGRES_DB}
-      - DB_POSTGRES_USER=${POSTGRES_USER}
-      - DB_POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB}
+      - DB_POSTGRESDB_USER=${POSTGRES_USER}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
       # Network/Host Settings - UPDATED FOR CADDY/HTTPS
       - N8N_LISTEN_ADDRESS=${N8N_LISTEN_ADDRESS}
       - N8N_PATH=${N8N_PATH}
