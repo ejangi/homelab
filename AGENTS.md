@@ -26,3 +26,15 @@ set +a
 Use the API only when the task calls for changing or inspecting the n8n
 instance. Never place the key in workflow JSON, source files, or command
 arguments.
+
+## Matrix notifications
+
+When changing the Matrix Service or the Matrix Sender Workflow, read
+the [Matrix notifications service and workflow specification](docs/specs/matrix-notifications.md).
+The Rust service lives in `src/matrix/`, uses Postgres for Matrix/client state,
+and is called by n8n at `MATRIX_SERVICE_URL` with `MATRIX_SERVICE_API_KEY`.
+
+Matrix secrets (`MATRIX_PASSWORD`, `MATRIX_STORE_ENCRYPTION_KEY`, and
+`MATRIX_SERVICE_API_KEY`) belong only in the local `.env`; keep them out of
+source files, workflow JSON, command arguments, and logs. Run Matrix Service
+migrations through Docker Compose, not manually against the database.

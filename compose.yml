@@ -30,6 +30,9 @@ services:
       - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
       - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
       - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      # Internal Matrix notification service
+      - MATRIX_SERVICE_URL=${MATRIX_SERVICE_URL}
+      - MATRIX_SERVICE_API_KEY=${MATRIX_SERVICE_API_KEY}
       # Change N8N_SECURE_COOKIE to true as we are using HTTPS
       - N8N_SECURE_COOKIE=${N8N_SECURE_COOKIE}
       - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
@@ -38,6 +41,34 @@ services:
       - n8n_data:/home/node/.n8n
     depends_on:
       - postgres
+    networks:
+      - n8n_backend
+
+  # 2.5 MATRIX SERVICE
+  matrix:
+    build:
+      context: ./src/matrix
+    container_name: n8n_matrix
+    restart: unless-stopped
+    environment:
+      - MATRIX_HOMESERVER_URL=${MATRIX_HOMESERVER_URL}
+      - MATRIX_USER_ID=${MATRIX_USER_ID}
+      - MATRIX_PASSWORD=${MATRIX_PASSWORD}
+      - MATRIX_DEFAULT_ROOM_ID=${MATRIX_DEFAULT_ROOM_ID}
+      - MATRIX_SERVICE_API_KEY=${MATRIX_SERVICE_API_KEY}
+      - MATRIX_STORE_ENCRYPTION_KEY=${MATRIX_STORE_ENCRYPTION_KEY}
+      - MATRIX_IDEMPOTENCY_RETENTION_DAYS=${MATRIX_IDEMPOTENCY_RETENTION_DAYS}
+      - MATRIX_DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - RUST_LOG=matrix_service=info,rocket=warn
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8787/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     networks:
       - n8n_backend
 
@@ -79,6 +110,7 @@ services:
       - caddy_data:/data
     depends_on:
       - n8n
+      - matrix
     networks:
       - n8n_backend
 

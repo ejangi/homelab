@@ -1,0 +1,111 @@
+{
+  "name": "Matrix Sender",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "message",
+              "type": "string"
+            },
+            {
+              "name": "room_id",
+              "type": "string"
+            },
+            {
+              "name": "format",
+              "type": "string"
+            },
+            {
+              "name": "encrypted",
+              "type": "boolean"
+            },
+            {
+              "name": "request_id",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "id": "9241c6da-f426-4f7c-9a75-9d8f4e80d646",
+      "name": "When Executed by Another Workflow",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.item.json;\n\nif (typeof input.message !== 'string' || input.message.trim() === '') {\n  throw new Error('message is required');\n}\n\nconst format = input.format ?? 'markdown';\nif (!['text', 'markdown', 'html'].includes(format)) {\n  throw new Error('format must be text, markdown, or html');\n}\n\nconst body = {\n  message: input.message,\n  format,\n  encrypted: typeof input.encrypted === 'boolean' ? input.encrypted : true,\n};\n\nif (typeof input.room_id === 'string' && input.room_id.trim() !== '') {\n  body.room_id = input.room_id.trim();\n}\n\nif (typeof input.request_id === 'string' && input.request_id.trim() !== '') {\n  body.request_id = input.request_id.trim();\n}\n\nreturn [{ json: body }];"
+      },
+      "id": "c981e81b-0c87-44c7-a17e-10772cae2cdc",
+      "name": "Prepare Matrix delivery",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.MATRIX_SERVICE_URL }}/v1/messages",
+        "authentication": "none",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.MATRIX_SERVICE_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}"
+      },
+      "id": "cb794f19-1d06-4881-a5e3-d28a2bb2d47d",
+      "name": "Send Matrix message",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        520,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Prepare Matrix delivery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Matrix delivery": {
+      "main": [
+        [
+          {
+            "node": "Send Matrix message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
