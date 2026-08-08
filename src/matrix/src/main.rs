@@ -513,13 +513,13 @@ async fn send_message(
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("Image attachment");
-        let image = match fetch_and_resize_shopify_image(&client, image_url, image_alt).await {
+        let image = match fetch_and_resize_public_image(&client, image_url, image_alt).await {
             Ok(image) => image,
             Err(error) => {
                 warn!(error = ?error, "Unable to prepare Matrix image attachment");
                 delete_in_progress_record(&state.pool, request_key.as_deref()).await;
                 return Err(ApiError::bad_request(
-                    "image_url must be a reachable HTTPS image hosted by cdn.shopify.com",
+                    "image_url must be a reachable HTTPS image hosted by an approved public CDN",
                 ));
             }
         };
@@ -672,17 +672,17 @@ fn format_content(message: &str, format: MessageFormat) -> RoomMessageEventConte
 const PRODUCT_IMAGE_MAX_DIMENSION: u32 = 256;
 const PRODUCT_IMAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
-/// Fetches only Rushfaster's current Shopify CDN images. Keeping this host
-/// allowlisted avoids turning the authenticated delivery API into a general
-/// network-fetch endpoint.
-async fn fetch_and_resize_shopify_image(
+/// Fetches images only from the public CDNs used by configured notification
+/// sources. Keeping this list explicit avoids turning the authenticated
+/// delivery API into a general network-fetch endpoint.
+async fn fetch_and_resize_public_image(
     matrix_client: &Client,
     image_url: &str,
     alt_text: &str,
 ) -> Result<RoomMessageEventContent> {
     let parsed = reqwest::Url::parse(image_url).context("parsing image URL")?;
-    if parsed.scheme() != "https" || parsed.host_str() != Some("cdn.shopify.com") {
-        return Err(anyhow!("image URL must use HTTPS and cdn.shopify.com"));
+    if parsed.scheme() != "https" || !is_allowed_image_host(parsed.host_str()) {
+        return Err(anyhow!("image URL must use HTTPS and an approved public CDN"));
     }
 
     let client = reqwest::Client::builder()
@@ -748,6 +748,10 @@ async fn fetch_and_resize_shopify_image(
     Ok(RoomMessageEventContent::new(MessageType::Image(
         ImageMessageEventContent::plain(alt_text.to_owned(), mxc_uri, Some(Box::new(info))),
     )))
+}
+
+fn is_allowed_image_host(host: Option<&str>) -> bool {
+    matches!(host, Some("cdn.shopify.com") | Some("res.cloudinary.com"))
 }
 
 #[derive(sqlx::FromRow)]
@@ -982,6 +986,14 @@ mod tests {
             Some("First image"),
         );
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn public_image_hosts_are_explicitly_allowlisted() {
+        assert!(is_allowed_image_host(Some("cdn.shopify.com")));
+        assert!(is_allowed_image_host(Some("res.cloudinary.com")));
+        assert!(!is_allowed_image_host(Some("proton.me")));
+        assert!(!is_allowed_image_host(Some("res.cloudinary.com.example.com")));
     }
 
     #[test]
