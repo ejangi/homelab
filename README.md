@@ -21,3 +21,10 @@ messages. The reusable **Matrix Sender** sub-workflow calls it internally.
 See the [Matrix notifications service and workflow specification](docs/specs/matrix-notifications.md)
 for setup, configuration, caller inputs, encryption behaviour, and recovery
 requirements.
+
+## DONKI CME alerts
+
+The [src/donki/](src/donki/) directory contains the n8n workflow definition for
+hourly alerts about Earth-directed coronal mass ejections (CMEs). It polls a
+rolling two-day DONKI window, keeps delivered reports in the `DONKI CME Reports`
+n8n data table, and sends human-readable notifications through Matrix Sender.

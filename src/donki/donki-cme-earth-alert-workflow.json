@@ -1,0 +1,330 @@
+{
+  "name": "DONKI Earth-directed CME alerts",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "3b376abc-8c9e-4369-a8b2-c7211fbcf02f",
+      "name": "Every hour",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -920,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://kauai.ccmc.gsfc.nasa.gov/DONKI/WS/get/CME?startDate={{ $now.minus({ days: 2 }).toFormat('yyyy-LL-dd') }}&endDate={{ $now.toFormat('yyyy-LL-dd') }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "f1d4270b-8ce3-4a1c-b307-e106d70e7a87",
+      "name": "Fetch CMEs from DONKI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        -680,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const startDate = $now.minus({ days: 2 }).toFormat('yyyy-LL-dd');\nconst endDate = $now.toFormat('yyyy-LL-dd');\n\n// CME records carry links to flare records, but not always the flare class itself.\n// Fetch the same two-day flare window so alerts can use the familiar C/M/X scale.\nlet flares = [];\ntry {\n  const response = await $helpers.httpRequest({\n    method: 'GET',\n    url: 'https://kauai.ccmc.gsfc.nasa.gov/DONKI/WS/get/FLR',\n    qs: { startDate, endDate },\n    json: true,\n    timeout: 30000,\n  });\n  flares = Array.isArray(response) ? response : [];\n} catch (error) {\n  // An Earth-directed CME is still worth alerting on if DONKI's flare feed is late.\n  console.warn(`Could not retrieve DONKI flare classes: ${error.message}`);\n}\n\nconst flaresById = new Map(flares.map((flare) => [flare.flrID, flare]));\nconst now = Date.now();\n\nfunction toMillis(value) {\n  if (!value) return null;\n  const millis = Date.parse(value);\n  return Number.isNaN(millis) ? null : millis;\n}\n\nfunction findEarthForecast(cme) {\n  const forecasts = [];\n  for (const analysis of cme.cmeAnalyses ?? []) {\n    for (const run of analysis.enlilList ?? []) {\n      const earthImpact = (run.impactList ?? []).find((impact) =>\n        String(impact.location ?? '').trim().toLowerCase() === 'earth',\n      );\n      const directedAtEarth = run.isEarthGB === true || run.isEarthMinorImpact === true || Boolean(earthImpact);\n      if (directedAtEarth) {\n        forecasts.push({\n          analysis,\n          run,\n          arrival: run.estimatedShockArrivalTime ?? earthImpact?.arrivalTime ?? null,\n          glancing: run.isEarthGB === true || earthImpact?.isGlancingBlow === true,\n        });\n      }\n    }\n  }\n\n  // Prefer DONKI's most recently completed model run when it has an Earth-impact prediction.\n  return forecasts.sort((a, b) =>\n    (toMillis(b.run.modelCompletionTime) ?? 0) - (toMillis(a.run.modelCompletionTime) ?? 0),\n  )[0];\n}\n\nfunction flareFor(cme) {\n  const flareLink = (cme.linkedEvents ?? []).find((event) =>\n    String(event.activityID ?? '').includes('-FLR-'),\n  );\n  return flareLink ? flaresById.get(flareLink.activityID) : undefined;\n}\n\nfunction arrivalText(arrival) {\n  const when = toMillis(arrival);\n  if (!when) return 'A timing estimate has not been published yet.';\n\n  const hours = Math.max(0, Math.round((when - now) / 3_600_000));\n  const utc = new Date(when).toISOString().replace('.000Z', ' UTC');\n  if (when >= now) return `About ${hours} hours (${utc}).`;\n  return `The forecast time was about ${Math.abs(Math.round((when - now) / 3_600_000))} hours ago (${utc}).`;\n}\n\nreturn $input.all()\n  .map((item) => item.json)\n  .filter((cme) => cme?.activityID)\n  .map((cme) => ({ cme, forecast: findEarthForecast(cme) }))\n  .filter(({ forecast }) => forecast)\n  .map(({ cme, forecast }) => {\n    const flare = flareFor(cme);\n    const intensity = flare?.classType ?? 'Not reported';\n    const arrival = forecast.arrival;\n    const reportUrl = cme.link ?? forecast.analysis.link ?? forecast.run.link;\n    const impactDescription = forecast.glancing\n      ? 'A glancing solar eruption is forecast to brush past Earth.'\n      : 'A solar eruption is forecast to affect Earth’s space environment.';\n\n    const message = [\n      '☀️ **Earth-directed solar eruption**',\n      '',\n      impactDescription,\n      `Solar flare intensity: **${intensity}**`,\n      `Estimated Earth arrival: **${arrivalText(arrival)}**`,\n      '',\n      '_This is a space-weather forecast, not a ground-level impact forecast._',\n      reportUrl ? `[Read the full DONKI observation](${reportUrl})` : null,\n    ].filter(Boolean).join('\\n');\n\n    return {\n      json: {\n        cme_id: cme.activityID,\n        first_seen_at: new Date().toISOString(),\n        arrival_at: arrival,\n        intensity,\n        observation_url: reportUrl,\n        message,\n        matrix_request_id: `donki-cme-${cme.activityID}`,\n      },\n    };\n  });"
+      },
+      "id": "cf6ee308-dd15-4bb5-9d02-89e82a7ecfe7",
+      "name": "Prepare Earth-directed CME alerts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -420,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "rowNotExists",
+        "dataTableId": {
+          "__rl": true,
+          "value": "5VZQ0mT7Rzd0cS5g",
+          "mode": "list",
+          "cachedResultName": "DONKI CME Reports"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "cme_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.cme_id }}"
+            }
+          ]
+        }
+      },
+      "id": "3c58c795-b264-45d3-94d8-d93b6363676b",
+      "name": "Only new CME reports",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        -160,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "wv07Z6jDBKWlgksk",
+          "mode": "list",
+          "cachedResultName": "Matrix Sender"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "message": "={{ $json.message }}",
+            "format": "markdown",
+            "encrypted": true,
+            "request_id": "={{ $json.matrix_request_id }}"
+          },
+          "schema": [
+            {
+              "id": "message",
+              "displayName": "message",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "room_id",
+              "displayName": "room_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "format",
+              "displayName": "format",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "encrypted",
+              "displayName": "encrypted",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "request_id",
+              "displayName": "request_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "mode": "each",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "b93af02e-193f-4207-81c8-9b308b142cc7",
+      "name": "Send Matrix notification",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        100,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const report = $('Prepare Earth-directed CME alerts').item.json;\n\nreturn {\n  json: {\n    cme_id: report.cme_id,\n    first_seen_at: report.first_seen_at,\n    arrival_at: report.arrival_at,\n    intensity: report.intensity,\n    observation_url: report.observation_url,\n    matrix_event_id: $json.event_id ?? null,\n  },\n};"
+      },
+      "id": "e95ab926-5bd7-44db-b464-899572c1ab09",
+      "name": "Prepare CME report record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        360,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "value": "5VZQ0mT7Rzd0cS5g",
+          "mode": "list",
+          "cachedResultName": "DONKI CME Reports"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "schema": [
+            {
+              "id": "cme_id",
+              "displayName": "cme_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "first_seen_at",
+              "displayName": "first_seen_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "date",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "arrival_at",
+              "displayName": "arrival_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "date",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "intensity",
+              "displayName": "intensity",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "observation_url",
+              "displayName": "observation_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "matrix_event_id",
+              "displayName": "matrix_event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "7c8ed8d7-712e-4d83-b2de-9ec087feb9f5",
+      "name": "Record seen CME report",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        620,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Every hour": {
+      "main": [
+        [
+          {
+            "node": "Fetch CMEs from DONKI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch CMEs from DONKI": {
+      "main": [
+        [
+          {
+            "node": "Prepare Earth-directed CME alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Earth-directed CME alerts": {
+      "main": [
+        [
+          {
+            "node": "Only new CME reports",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Only new CME reports": {
+      "main": [
+        [
+          {
+            "node": "Send Matrix notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Matrix notification": {
+      "main": [
+        [
+          {
+            "node": "Prepare CME report record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare CME report record": {
+      "main": [
+        [
+          {
+            "node": "Record seen CME report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Australia/Brisbane"
+  }
+}
