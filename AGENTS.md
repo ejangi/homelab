@@ -52,6 +52,11 @@ Matrix secrets (`MATRIX_PASSWORD`, `MATRIX_STORE_ENCRYPTION_KEY`, and
 source files, workflow JSON, command arguments, and logs. Run Matrix Service
 migrations through Docker Compose, not manually against the database.
 
+The reusable Matrix Sender Workflow accepts `message`, optional `room_id`,
+`format`, `encrypted`, and `request_id`; it also accepts optional public Shopify
+CDN `image_url` and `image_alt` inputs for a 256 × 256-or-smaller product-image
+attachment. See `docs/specs/matrix-notifications.md` for the complete contract.
+
 ## Matrix workflow previews
 
 After creating or changing an n8n workflow that delivers Matrix notifications,

@@ -6,9 +6,9 @@ Provide one reusable, authenticated way for n8n workflows to post Matrix notific
 
 ## Scope
 
-The initial release supports one Matrix account, text messages, Markdown, HTML, optional plaintext delivery, idempotent retries, and Matrix end-to-end encryption for any room that the configured Matrix account has joined and may post to.
+The service supports one Matrix account, text messages, Markdown, HTML, optional plaintext delivery, idempotent retries, and Matrix end-to-end encryption for any room that the configured Matrix account has joined and may post to. It can also attach a resized product image hosted on Shopify's CDN.
 
-It does not support attachments, reactions, replies, inbound Matrix event processing, room creation, or arbitrary Matrix event types.
+It does not support arbitrary attachments, reactions, replies, inbound Matrix event processing, room creation, or arbitrary Matrix event types.
 
 ## Components
 
@@ -71,7 +71,7 @@ The protected setup UI is available at `/matrix/setup` and contains the explicit
 
 ### `POST /v1/messages`
 
-Posts exactly one Matrix `m.room.message` event.
+Posts one Matrix text event and, when an image is supplied, an `m.image` event immediately before it.
 
 Request body:
 
@@ -81,7 +81,9 @@ Request body:
   "room_id": "!optional-room:matrix.org",
   "format": "markdown",
   "encrypted": true,
-  "request_id": "deploy-2026-08-08-42"
+  "request_id": "deploy-2026-08-08-42",
+  "image_url": "https://cdn.shopify.com/example-product.jpg",
+  "image_alt": "Example product"
 }
 ```
 
@@ -96,12 +98,16 @@ Rules:
 - `encrypted: true` requires that the room has Matrix encryption enabled. Failure to establish or share encryption state fails the request; no plaintext fallback is permitted.
 - `encrypted: false` sends a standard plaintext `m.room.message`, even if the room is encrypted. This must be explicit and is recorded in the response and audit metadata.
 - `request_id` is optional. When supplied, it is an idempotency key scoped to the effective room and request payload.
+- `image_url` is optional. It must be an HTTPS URL on `cdn.shopify.com`; the service downloads at most 10 MiB, resizes it to fit within 256 × 256 pixels while preserving aspect ratio, encodes it as JPEG, uploads it to Matrix, and sends an `m.image` event before the text message. Redirects are not followed.
+- `image_alt` is optional alt text for the image event; it defaults to `Image attachment`.
+- The image event is encrypted as a Matrix event when `encrypted: true`, but this initial implementation uploads the JPEG to Matrix without per-attachment encryption because the pinned Matrix SDK 0.5 lacks encrypted media upload support. This is appropriate only for public imagery such as retailer product photos.
 
 Successful response:
 
 ```json
 {
   "event_id": "$matrix-event-id",
+  "image_event_id": "$matrix-image-event-id",
   "room_id": "!gGNQxnBRzxaGuIcEzJ:matrix.org",
   "encrypted": true,
   "idempotent_replay": false,
@@ -173,6 +179,8 @@ The workflow begins with an Execute Sub-workflow Trigger and defines these typed
 | `format` | string | No | `markdown` |
 | `encrypted` | boolean | No | `true` |
 | `request_id` | string | No | — |
+| `image_url` | string | No | — |
+| `image_alt` | string | No | — |
 
 The imported workflow is stored in `src/matrix/n8n-matrix-sender-workflow.json`. It calls `POST {{$env.MATRIX_SERVICE_URL}}/v1/messages` using an environment-backed `Authorization: Bearer {{$env.MATRIX_SERVICE_API_KEY}}` header. It returns the service response to the calling workflow and fails the execution on non-success responses.
 

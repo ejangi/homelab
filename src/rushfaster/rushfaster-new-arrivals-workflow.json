@@ -1,0 +1,179 @@
+{
+  "name": "Rushfaster new arrivals",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      },
+      "id": "3d10b5d1-5e95-45d5-b172-983be75eed59",
+      "name": "Every day at 7 AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-920, 0]
+    },
+    {
+      "parameters": {
+        "url": "https://rushfaster.com.au/collections/new-arrivals.atom",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "03e64c95-62c3-48b6-8356-74c7db96d546",
+      "name": "Fetch Rushfaster Atom feed",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1,
+      "position": [-680, 0]
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "0cb1cbe6-447e-4312-a014-dc232fe8ef5a",
+      "name": "Run on demand",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [-920, 180]
+    },
+    {
+      "parameters": {
+        "jsCode": "function requestIdFor(value) {\n  let hash = 5381;\n  for (const character of value) {\n    hash = ((hash << 5) + hash) ^ character.charCodeAt(0);\n  }\n  return `rushfaster-arrival-${(hash >>> 0).toString(36)}`;\n}\n\nfunction decodeHtml(value) {\n  const named = { amp: '&', apos: \"'\", copy: '©', gt: '>', hellip: '…', lt: '<', nbsp: ' ', quot: '\"', reg: '®', rsquo: '’', trade: '™' };\n  return value\n    .replace(/&(#x[0-9a-f]+|#\\d+|[a-z]+);/gi, (match, entity) => {\n      const key = entity.toLowerCase();\n      if (key.startsWith('#x')) return String.fromCodePoint(parseInt(key.slice(2), 16));\n      if (key.startsWith('#')) return String.fromCodePoint(parseInt(key.slice(1), 10));\n      return named[key] ?? match;\n    });\n}\n\nfunction toPlainText(value) {\n  return decodeHtml(value\n    .replace(/<script[\\s\\S]*?<\\/script>|<style[\\s\\S]*?<\\/style>/gi, '')\n    .replace(/<br\\s*\\/?\\s*>/gi, ' ')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim());\n}\n\nfunction escapeMarkdown(value) {\n  return value.replace(/([\\\\`*_{}[\\]<>])/g, '\\\\$1');\n}\n\nfunction compact(value, maxLength) {\n  return value.length <= maxLength ? value : `${value.slice(0, maxLength - 1).trimEnd()}…`;\n}\n\nreturn $input.all().map((item) => {\n  const product = item.json;\n  const productId = String(product.guid ?? product.id ?? product.link ?? '').trim();\n  const title = String(product.title ?? '').trim();\n  const productUrl = String(product.link ?? '').trim();\n  // Atom feeds expose their HTML item body as summary; RSS feeds use content.\n  const summary = String(product.summary ?? product.content ?? product.contentSnippet ?? product.description ?? '').trim();\n  const imageUrl = summary.match(/<img\\b[^>]*\\bsrc=[\"']([^\"']+)/i)?.[1]?.trim() ?? '';\n  const price = summary.match(/<strong>\\s*Price:\\s*<\\/strong>\\s*([0-9]+(?:[.,][0-9]{2})?)/i)?.[1]?.replace(',', '.') ?? '';\n  const descriptionHtml = summary.match(/<td\\b[^>]*\\bcolspan=[\"']?2[\"']?[^>]*>\\s*<p[^>]*>([\\s\\S]*?)<\\/p>/i)?.[1] ?? summary;\n  const description = compact(toPlainText(descriptionHtml), 700);\n\n  if (!productId || !title || !productUrl || !price || !imageUrl || !description) {\n    throw new Error(`Rushfaster feed item is missing required product fields: ${productId || title || productUrl || 'unknown product'}`);\n  }\n\n  const published = new Date(product.isoDate ?? product.pubDate ?? '');\n  const publishedAt = Number.isNaN(published.valueOf()) ? null : published.toISOString();\n\n  return {\n    json: {\n      product_id: productId,\n      title,\n      description,\n      price: `$${price} AUD`,\n      product_url: productUrl,\n      image_url: imageUrl,\n      published_at: publishedAt,\n      first_seen_at: new Date().toISOString(),\n      message: [\n        '🆕 **New Rushfaster arrival**',\n        '',\n        `**${escapeMarkdown(title)}**`,\n        '',\n        `**Price:** $${price} AUD`,\n        '',\n        escapeMarkdown(description),\n        '',\n        `[View product on Rushfaster](${productUrl})`,\n      ].join('\\n'),\n      image_alt: `${title} product image`,\n      matrix_request_id: requestIdFor(productId),\n    },\n  };\n});"
+      },
+      "id": "ed44e9bd-1c99-4d16-942e-2e15c7ea98be",
+      "name": "Prepare Rushfaster products",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-420, 0]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "rowNotExists",
+        "dataTableId": {
+          "__rl": true,
+          "value": "zX55zar2iqCeuD2C",
+          "mode": "list",
+          "cachedResultName": "Rushfaster New Arrivals"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "product_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.product_id }}"
+            }
+          ]
+        }
+      },
+      "id": "4e1ad1c8-6f7a-44cc-b6fa-b9fc1a47a727",
+      "name": "Only new Rushfaster products",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [-160, 0]
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "wv07Z6jDBKWlgksk",
+          "mode": "list",
+          "cachedResultName": "Matrix Sender"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "message": "={{ $json.message }}",
+            "format": "markdown",
+            "encrypted": true,
+            "request_id": "={{ $json.matrix_request_id }}",
+            "image_url": "={{ $json.image_url }}",
+            "image_alt": "={{ $json.image_alt }}"
+          },
+          "schema": [
+            { "id": "message", "displayName": "message", "required": true, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "room_id", "displayName": "room_id", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "format", "displayName": "format", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "encrypted", "displayName": "encrypted", "required": false, "defaultMatch": false, "display": true, "type": "boolean", "canBeUsedToMatch": true },
+            { "id": "request_id", "displayName": "request_id", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "image_url", "displayName": "image_url", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "image_alt", "displayName": "image_alt", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true }
+          ]
+        },
+        "mode": "each",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "1a63afc0-3ee2-4e03-8cef-8ac2cab1ebce",
+      "name": "Send Matrix notification",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [100, 0]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const product = $('Prepare Rushfaster products').item.json;\n\nreturn {\n  json: {\n    product_id: product.product_id,\n    title: product.title,\n    description: product.description,\n    price: product.price,\n    product_url: product.product_url,\n    image_url: product.image_url,\n    published_at: product.published_at,\n    first_seen_at: product.first_seen_at,\n    matrix_event_id: $json.event_id ?? null,\n  },\n};"
+      },
+      "id": "1b2a3f4d-3bea-4d7c-b9a5-beba068e3bf2",
+      "name": "Prepare seen Rushfaster product record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [360, 0]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "value": "zX55zar2iqCeuD2C",
+          "mode": "list",
+          "cachedResultName": "Rushfaster New Arrivals"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "schema": [
+            { "id": "product_id", "displayName": "product_id", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "title", "displayName": "title", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "description", "displayName": "description", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "price", "displayName": "price", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "product_url", "displayName": "product_url", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "image_url", "displayName": "image_url", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "published_at", "displayName": "published_at", "required": false, "defaultMatch": false, "display": true, "type": "date", "canBeUsedToMatch": true },
+            { "id": "first_seen_at", "displayName": "first_seen_at", "required": false, "defaultMatch": false, "display": true, "type": "date", "canBeUsedToMatch": true },
+            { "id": "matrix_event_id", "displayName": "matrix_event_id", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a5170c1d-08b6-4771-8127-1a08ebd1fbbf",
+      "name": "Record seen Rushfaster product",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [620, 0]
+    }
+  ],
+  "connections": {
+    "Every day at 7 AM": { "main": [[{ "node": "Fetch Rushfaster Atom feed", "type": "main", "index": 0 }]] },
+    "Run on demand": { "main": [[{ "node": "Fetch Rushfaster Atom feed", "type": "main", "index": 0 }]] },
+    "Fetch Rushfaster Atom feed": { "main": [[{ "node": "Prepare Rushfaster products", "type": "main", "index": 0 }]] },
+    "Prepare Rushfaster products": { "main": [[{ "node": "Only new Rushfaster products", "type": "main", "index": 0 }]] },
+    "Only new Rushfaster products": { "main": [[{ "node": "Send Matrix notification", "type": "main", "index": 0 }]] },
+    "Send Matrix notification": { "main": [[{ "node": "Prepare seen Rushfaster product record", "type": "main", "index": 0 }]] },
+    "Prepare seen Rushfaster product record": { "main": [[{ "node": "Record seen Rushfaster product", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Australia/Brisbane"
+  }
+}
