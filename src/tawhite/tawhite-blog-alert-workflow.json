@@ -1,0 +1,330 @@
+{
+  "name": "T.A. White blog alerts",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      },
+      "id": "ff345145-5622-439e-bf67-30ce51647f90",
+      "name": "Every day at 7 AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -920,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://tawhiteauthor.com/feed/",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "e87f503c-8d74-4e7a-8661-fc3ff1c9a602",
+      "name": "Fetch T.A. White RSS feed",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1,
+      "position": [
+        -680,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function requestIdFor(value) {\n  let hash = 5381;\n  for (const character of value) {\n    hash = ((hash << 5) + hash) ^ character.charCodeAt(0);\n  }\n  return `ta-white-blog-${(hash >>> 0).toString(36)}`;\n}\n\nfunction formatInBrisbane(date) {\n  return new Intl.DateTimeFormat('en-AU', {\n    timeZone: 'Australia/Brisbane',\n    day: '2-digit',\n    month: 'short',\n    year: 'numeric',\n    hour: 'numeric',\n    minute: '2-digit',\n    hour12: true,\n    timeZoneName: 'short',\n  }).format(date);\n}\n\nreturn $input.all().flatMap((item) => {\n  const post = item.json;\n  const postUrl = typeof post.link === 'string' ? post.link.trim() : '';\n  const postId = String(post.guid ?? postUrl).trim();\n  const title = String(post.title ?? '').trim();\n\n  if (!postId || !postUrl || !title) {\n    return [];\n  }\n\n  const published = new Date(post.isoDate ?? post.pubDate ?? '');\n  const publishedAt = Number.isNaN(published.valueOf()) ? null : published.toISOString();\n  const publishedInBrisbane = publishedAt ? formatInBrisbane(published) : null;\n\n  return [{\n    json: {\n      post_id: postId,\n      title,\n      post_url: postUrl,\n      published_at: publishedAt,\n      first_seen_at: new Date().toISOString(),\n      message: [\n        '📚 **New T.A. White blog post**',\n        '',\n        `[${title}](${postUrl})`,\n        publishedInBrisbane ? `Published: ${publishedInBrisbane}` : null,\n      ].filter(Boolean).join('\\n'),\n      matrix_request_id: requestIdFor(postId),\n    },\n  }];\n});"
+      },
+      "id": "837d506c-4146-45a2-9c0f-f7516d890e97",
+      "name": "Prepare blog posts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -420,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "rowNotExists",
+        "dataTableId": {
+          "__rl": true,
+          "value": "fnyX1tYouxusDl2c",
+          "mode": "list",
+          "cachedResultName": "T.A. White Blog Posts"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "post_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.post_id }}"
+            }
+          ]
+        }
+      },
+      "id": "ec198ba8-7e09-4d94-b36c-5e9d1a3fec53",
+      "name": "Only new blog posts",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        -160,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "wv07Z6jDBKWlgksk",
+          "mode": "list",
+          "cachedResultName": "Matrix Sender"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "message": "={{ $json.message }}",
+            "format": "markdown",
+            "encrypted": true,
+            "request_id": "={{ $json.matrix_request_id }}"
+          },
+          "schema": [
+            {
+              "id": "message",
+              "displayName": "message",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "room_id",
+              "displayName": "room_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "format",
+              "displayName": "format",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "encrypted",
+              "displayName": "encrypted",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "request_id",
+              "displayName": "request_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "mode": "each",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "c990c1a7-4ac1-4e61-ac7d-5cc1d5be167b",
+      "name": "Send Matrix notification",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        100,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const post = $('Prepare blog posts').item.json;\n\nreturn {\n  json: {\n    post_id: post.post_id,\n    title: post.title,\n    post_url: post.post_url,\n    published_at: post.published_at,\n    first_seen_at: post.first_seen_at,\n    matrix_event_id: $json.event_id ?? null,\n  },\n};"
+      },
+      "id": "e944fadb-c051-4539-95d1-85446a73fd07",
+      "name": "Prepare seen post record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        360,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "value": "fnyX1tYouxusDl2c",
+          "mode": "list",
+          "cachedResultName": "T.A. White Blog Posts"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "schema": [
+            {
+              "id": "post_id",
+              "displayName": "post_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "title",
+              "displayName": "title",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "post_url",
+              "displayName": "post_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "published_at",
+              "displayName": "published_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "date",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "first_seen_at",
+              "displayName": "first_seen_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "date",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "matrix_event_id",
+              "displayName": "matrix_event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "3a3d5604-0f93-40e1-85c2-3625e2bd6b7a",
+      "name": "Record seen blog post",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        620,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Every day at 7 AM": {
+      "main": [
+        [
+          {
+            "node": "Fetch T.A. White RSS feed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch T.A. White RSS feed": {
+      "main": [
+        [
+          {
+            "node": "Prepare blog posts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare blog posts": {
+      "main": [
+        [
+          {
+            "node": "Only new blog posts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Only new blog posts": {
+      "main": [
+        [
+          {
+            "node": "Send Matrix notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Matrix notification": {
+      "main": [
+        [
+          {
+            "node": "Prepare seen post record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare seen post record": {
+      "main": [
+        [
+          {
+            "node": "Record seen blog post",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Australia/Brisbane"
+  }
+}
