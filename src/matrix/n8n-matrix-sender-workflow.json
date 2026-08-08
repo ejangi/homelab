@@ -25,6 +25,14 @@
             {
               "name": "request_id",
               "type": "string"
+            },
+            {
+              "name": "image_url",
+              "type": "string"
+            },
+            {
+              "name": "image_alt",
+              "type": "string"
             }
           ]
         }
@@ -40,7 +48,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const input = $input.item.json;\n\nif (typeof input.message !== 'string' || input.message.trim() === '') {\n  throw new Error('message is required');\n}\n\nconst format = input.format ?? 'markdown';\nif (!['text', 'markdown', 'html'].includes(format)) {\n  throw new Error('format must be text, markdown, or html');\n}\n\nconst body = {\n  message: input.message,\n  format,\n  encrypted: typeof input.encrypted === 'boolean' ? input.encrypted : true,\n};\n\nif (typeof input.room_id === 'string' && input.room_id.trim() !== '') {\n  body.room_id = input.room_id.trim();\n}\n\nif (typeof input.request_id === 'string' && input.request_id.trim() !== '') {\n  body.request_id = input.request_id.trim();\n}\n\nreturn [{ json: body }];"
+        "jsCode": "const input = $input.item.json;\n\nif (typeof input.message !== 'string' || input.message.trim() === '') {\n  throw new Error('message is required');\n}\n\nconst format = input.format ?? 'markdown';\nif (!['text', 'markdown', 'html'].includes(format)) {\n  throw new Error('format must be text, markdown, or html');\n}\n\nconst body = {\n  message: input.message,\n  format,\n  encrypted: typeof input.encrypted === 'boolean' ? input.encrypted : true,\n};\n\nfor (const key of ['room_id', 'request_id', 'image_url', 'image_alt']) {\n  if (typeof input[key] === 'string' && input[key].trim() !== '') {\n    body[key] = input[key].trim();\n  }\n}\n\nreturn [{ json: body }];"
       },
       "id": "c981e81b-0c87-44c7-a17e-10772cae2cdc",
       "name": "Prepare Matrix delivery",

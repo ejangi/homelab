@@ -1,14 +1,16 @@
-use std::{env, sync::Arc};
+use std::{env, io::Cursor, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
+use futures_util::StreamExt;
+use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, GenericImageView, ImageReader};
 use matrix_sdk::{
     config::SyncSettings,
     room::Joined,
     ruma::{
         api::client::message::send_message_event,
-        events::room::message::RoomMessageEventContent,
+        events::room::{message::{ImageMessageEventContent, MessageType, RoomMessageEventContent}, ImageInfo},
         serde::Raw,
-        OwnedRoomId, OwnedTransactionId,
+        OwnedRoomId, OwnedTransactionId, UInt,
     },
     Client,
 };
@@ -269,6 +271,8 @@ struct SendMessageRequest {
     format: Option<MessageFormat>,
     encrypted: Option<bool>,
     request_id: Option<String>,
+    image_url: Option<String>,
+    image_alt: Option<String>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -293,6 +297,8 @@ impl MessageFormat {
 #[serde(crate = "rocket::serde")]
 struct SendMessageResponse {
     event_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_event_id: Option<String>,
     room_id: String,
     encrypted: bool,
     idempotent_replay: bool,
@@ -462,7 +468,14 @@ async fn send_message(
         });
     }
 
-    let request_hash = request_hash(&request.message, room_id.as_str(), format, encrypted);
+    let request_hash = request_hash(
+        &request.message,
+        room_id.as_str(),
+        format,
+        encrypted,
+        request.image_url.as_deref(),
+        request.image_alt.as_deref(),
+    );
     let request_key = request
         .request_id
         .as_deref()
@@ -480,6 +493,7 @@ async fn send_message(
             if let Some(event_id) = existing.event_id {
                 return Ok(Json(SendMessageResponse {
                     event_id,
+                    image_event_id: None,
                     room_id: existing.room_id,
                     encrypted: existing.encrypted,
                     idempotent_replay: true,
@@ -493,7 +507,42 @@ async fn send_message(
             .map_err(ApiError::internal)?;
     }
 
-    let transaction_id = stable_transaction_id(request_key.as_deref(), &request_hash)
+    let image_event_id = if let Some(image_url) = request.image_url.as_deref() {
+        let image_alt = request
+            .image_alt
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("Image attachment");
+        let image = match fetch_and_resize_shopify_image(&client, image_url, image_alt).await {
+            Ok(image) => image,
+            Err(error) => {
+                warn!(error = ?error, "Unable to prepare Matrix image attachment");
+                delete_in_progress_record(&state.pool, request_key.as_deref()).await;
+                return Err(ApiError::bad_request(
+                    "image_url must be a reachable HTTPS image hosted by cdn.shopify.com",
+                ));
+            }
+        };
+        let image_transaction_id = stable_transaction_id(request_key.as_deref(), &request_hash, "image")
+            .map_err(ApiError::internal)?;
+        let response = if encrypted {
+            send_encrypted(&room, image, &image_transaction_id).await
+        } else {
+            send_plaintext(&client, &room_id, image, &image_transaction_id).await
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                delete_in_progress_record(&state.pool, request_key.as_deref()).await;
+                return Err(ApiError::internal(error));
+            }
+        };
+        Some(response.event_id.to_string())
+    } else {
+        None
+    };
+
+    let transaction_id = stable_transaction_id(request_key.as_deref(), &request_hash, "message")
         .map_err(ApiError::internal)?;
     let content = format_content(&request.message, format);
     let result = if encrypted {
@@ -505,14 +554,7 @@ async fn send_message(
     let response = match result {
         Ok(response) => response,
         Err(error) => {
-            if let Some(request_key) = request_key.as_deref() {
-                let _ = sqlx::query(
-                    "DELETE FROM matrix_service.idempotency_records WHERE request_key = $1 AND status = 'in_progress'",
-                )
-                .bind(request_key)
-                .execute(&state.pool)
-                .await;
-            }
+            delete_in_progress_record(&state.pool, request_key.as_deref()).await;
             return Err(ApiError::internal(error));
         }
     };
@@ -526,6 +568,7 @@ async fn send_message(
 
     Ok(Json(SendMessageResponse {
         event_id,
+        image_event_id,
         room_id: room_id.to_string(),
         encrypted,
         idempotent_replay: false,
@@ -626,6 +669,87 @@ fn format_content(message: &str, format: MessageFormat) -> RoomMessageEventConte
     }
 }
 
+const PRODUCT_IMAGE_MAX_DIMENSION: u32 = 256;
+const PRODUCT_IMAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Fetches only Rushfaster's current Shopify CDN images. Keeping this host
+/// allowlisted avoids turning the authenticated delivery API into a general
+/// network-fetch endpoint.
+async fn fetch_and_resize_shopify_image(
+    matrix_client: &Client,
+    image_url: &str,
+    alt_text: &str,
+) -> Result<RoomMessageEventContent> {
+    let parsed = reqwest::Url::parse(image_url).context("parsing image URL")?;
+    if parsed.scheme() != "https" || parsed.host_str() != Some("cdn.shopify.com") {
+        return Err(anyhow!("image URL must use HTTPS and cdn.shopify.com"));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("creating image download client")?;
+    let response = client
+        .get(parsed)
+        .send()
+        .await
+        .context("downloading product image")?
+        .error_for_status()
+        .context("product image host returned an error")?;
+
+    if response
+        .content_length()
+        .is_some_and(|length| length > PRODUCT_IMAGE_MAX_BYTES)
+    {
+        return Err(anyhow!("product image exceeds the 10 MiB download limit"));
+    }
+
+    let mut body = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.context("reading product image")?;
+        if bytes.len() + chunk.len() > PRODUCT_IMAGE_MAX_BYTES as usize {
+            return Err(anyhow!("product image exceeds the 10 MiB download limit"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    let source = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .context("detecting product image format")?
+        .decode()
+        .context("decoding product image")?;
+    let resized = source.resize(
+        PRODUCT_IMAGE_MAX_DIMENSION,
+        PRODUCT_IMAGE_MAX_DIMENSION,
+        FilterType::Lanczos3,
+    );
+    let (width, height) = resized.dimensions();
+    let mut encoded = Vec::new();
+    JpegEncoder::new_with_quality(&mut encoded, 85)
+        .encode_image(&resized)
+        .context("encoding resized product image")?;
+
+    let size = UInt::try_from(encoded.len()).context("recording resized image size")?;
+    let width = UInt::try_from(width).context("recording resized image width")?;
+    let height = UInt::try_from(height).context("recording resized image height")?;
+    let mut upload = Cursor::new(encoded);
+    let mxc_uri = matrix_client
+        .upload(&mime::IMAGE_JPEG, &mut upload)
+        .await
+        .context("uploading resized product image to Matrix")?
+        .content_uri;
+    let mut info = ImageInfo::new();
+    info.width = Some(width);
+    info.height = Some(height);
+    info.mimetype = Some("image/jpeg".into());
+    info.size = Some(size);
+    Ok(RoomMessageEventContent::new(MessageType::Image(
+        ImageMessageEventContent::plain(alt_text.to_owned(), mxc_uri, Some(Box::new(info))),
+    )))
+}
+
 #[derive(sqlx::FromRow)]
 struct IdempotencyRecord {
     request_hash: String,
@@ -682,7 +806,26 @@ async fn complete_idempotency_record(pool: &PgPool, request_key: &str, event_id:
     Ok(())
 }
 
-fn request_hash(message: &str, room_id: &str, format: MessageFormat, encrypted: bool) -> String {
+async fn delete_in_progress_record(pool: &PgPool, request_key: Option<&str>) {
+    let Some(request_key) = request_key else {
+        return;
+    };
+    let _ = sqlx::query(
+        "DELETE FROM matrix_service.idempotency_records WHERE request_key = $1 AND status = 'in_progress'",
+    )
+    .bind(request_key)
+    .execute(pool)
+    .await;
+}
+
+fn request_hash(
+    message: &str,
+    room_id: &str,
+    format: MessageFormat,
+    encrypted: bool,
+    image_url: Option<&str>,
+    image_alt: Option<&str>,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(message.as_bytes());
     hasher.update([0]);
@@ -691,6 +834,10 @@ fn request_hash(message: &str, room_id: &str, format: MessageFormat, encrypted: 
     hasher.update(format.as_str().as_bytes());
     hasher.update([0]);
     hasher.update([u8::from(encrypted)]);
+    hasher.update([0]);
+    hasher.update(image_url.unwrap_or_default().as_bytes());
+    hasher.update([0]);
+    hasher.update(image_alt.unwrap_or_default().as_bytes());
     hex::encode(hasher.finalize())
 }
 
@@ -702,10 +849,10 @@ fn idempotency_key(request_id: &str, room_id: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn stable_transaction_id(request_key: Option<&str>, request_hash: &str) -> Result<OwnedTransactionId> {
+fn stable_transaction_id(request_key: Option<&str>, request_hash: &str, kind: &str) -> Result<OwnedTransactionId> {
     let value = request_key
-        .map(|key| format!("n8n-{}", &key[..32]))
-        .unwrap_or_else(|| format!("n8n-{}", Uuid::new_v4().simple()));
+        .map(|key| format!("n8n-{kind}-{}", &key[..28]))
+        .unwrap_or_else(|| format!("n8n-{kind}-{}", Uuid::new_v4().simple()));
     value
         .try_into()
         .map_err(|_| anyhow!("unable to create Matrix transaction ID from {request_hash}"))
@@ -811,9 +958,30 @@ mod tests {
 
     #[test]
     fn request_hash_changes_when_encryption_mode_changes() {
-        let encrypted = request_hash("hello", "!room:example.org", MessageFormat::Markdown, true);
-        let plaintext = request_hash("hello", "!room:example.org", MessageFormat::Markdown, false);
+        let encrypted = request_hash("hello", "!room:example.org", MessageFormat::Markdown, true, None, None);
+        let plaintext = request_hash("hello", "!room:example.org", MessageFormat::Markdown, false, None, None);
         assert_ne!(encrypted, plaintext);
+    }
+
+    #[test]
+    fn request_hash_changes_when_image_changes() {
+        let first = request_hash(
+            "hello",
+            "!room:example.org",
+            MessageFormat::Markdown,
+            true,
+            Some("https://cdn.shopify.com/one.jpg"),
+            Some("First image"),
+        );
+        let second = request_hash(
+            "hello",
+            "!room:example.org",
+            MessageFormat::Markdown,
+            true,
+            Some("https://cdn.shopify.com/two.jpg"),
+            Some("First image"),
+        );
+        assert_ne!(first, second);
     }
 
     #[test]
