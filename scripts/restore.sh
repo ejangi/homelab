@@ -30,14 +30,14 @@ SAFETY_FILE="$BACKUP_DIR/n8n_pre_restore_${TIMESTAMP}.dump"
 cleanup() {
   status=$?
   echo "Starting n8n services..."
-  $COMPOSE up -d n8n caddy postgres_backup >/dev/null || true
+  $COMPOSE up -d matrix n8n caddy postgres_backup >/dev/null || true
   exit "$status"
 }
 trap cleanup EXIT INT TERM
 
 echo "Using restore file: $RESTORE_FILE"
-echo "Stopping n8n and backup services while the database is replaced..."
-$COMPOSE stop n8n caddy postgres_backup >/dev/null || true
+echo "Stopping Matrix, n8n, and backup services while the database is replaced..."
+$COMPOSE stop matrix n8n caddy postgres_backup >/dev/null || true
 
 echo "Starting PostgreSQL..."
 $COMPOSE up -d postgres >/dev/null

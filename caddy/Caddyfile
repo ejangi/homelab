@@ -19,4 +19,10 @@ ejangi-nix.bobtail-morpho.ts.net, localhost:8080 {
         }
     }
 
+    # Matrix Service setup UI and authenticated API. The matrix container is
+    # not published directly; this route is reachable only through Caddy.
+    handle_path /matrix/* {
+        reverse_proxy matrix:8787
+    }
+
 }
