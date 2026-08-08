@@ -38,3 +38,11 @@ Matrix secrets (`MATRIX_PASSWORD`, `MATRIX_STORE_ENCRYPTION_KEY`, and
 `MATRIX_SERVICE_API_KEY`) belong only in the local `.env`; keep them out of
 source files, workflow JSON, command arguments, and logs. Run Matrix Service
 migrations through Docker Compose, not manually against the database.
+
+## DONKI CME alerts
+
+`src/donki/` contains the checked-in workflow definition for DONKI
+Earth-directed CME alerts. The workflow polls DONKI, deduplicates delivered
+reports with the `DONKI CME Reports` n8n data table, and calls the Matrix Sender
+Workflow for notifications. Keep its Matrix delivery inputs secret-free and
+update the checked-in JSON whenever the imported n8n workflow changes.
