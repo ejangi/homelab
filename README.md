@@ -28,3 +28,10 @@ The [src/donki/](src/donki/) directory contains the n8n workflow definition for
 hourly alerts about Earth-directed coronal mass ejections (CMEs). It polls a
 rolling two-day DONKI window, keeps delivered reports in the `DONKI CME Reports`
 n8n data table, and sends human-readable notifications through Matrix Sender.
+
+## Goodreads science-fiction alerts
+
+The [src/goodreads/](src/goodreads/) workflow checks the configured Goodreads
+genre API every day, records each delivered book in the `Goodreads Science
+Fiction Books` n8n data table, and sends newly listed books through Matrix
+Sender with their Goodreads cover image.

@@ -6,7 +6,7 @@ Provide one reusable, authenticated way for n8n workflows to post Matrix notific
 
 ## Scope
 
-The service supports one Matrix account, text messages, Markdown, HTML, optional plaintext delivery, idempotent retries, and Matrix end-to-end encryption for any room that the configured Matrix account has joined and may post to. It can also attach a resized product image hosted on Shopify's CDN.
+The service supports one Matrix account, text messages, Markdown, HTML, optional plaintext delivery, idempotent retries, and Matrix end-to-end encryption for any room that the configured Matrix account has joined and may post to. It can also attach a resized public product or book-cover image.
 
 It does not support arbitrary attachments, reactions, replies, inbound Matrix event processing, room creation, or arbitrary Matrix event types.
 
@@ -98,7 +98,7 @@ Rules:
 - `encrypted: true` requires that the room has Matrix encryption enabled. Failure to establish or share encryption state fails the request; no plaintext fallback is permitted.
 - `encrypted: false` sends a standard plaintext `m.room.message`, even if the room is encrypted. This must be explicit and is recorded in the response and audit metadata.
 - `request_id` is optional. When supplied, it is an idempotency key scoped to the effective room and request payload.
-- `image_url` is optional. It must be an HTTPS URL on an approved public image CDN (`cdn.shopify.com` for Rushfaster product images or `res.cloudinary.com` for Proton Blog images); the service downloads at most 10 MiB, resizes it to fit within 256 × 256 pixels while preserving aspect ratio, encodes it as JPEG, uploads it to Matrix, and sends an `m.image` event before the text message. Redirects are not followed.
+- `image_url` is optional. It must be an HTTPS URL on an approved public image CDN (`cdn.shopify.com` for Rushfaster product images, `res.cloudinary.com` for Proton Blog images, or `i.gr-assets.com` for Goodreads book covers); the service downloads at most 10 MiB, resizes it to fit within 256 × 256 pixels while preserving aspect ratio, encodes it as JPEG, uploads it to Matrix, and sends an `m.image` event before the text message. Redirects are not followed.
 - `image_alt` is optional alt text for the image event; it defaults to `Image attachment`.
 - The image event is encrypted as a Matrix event when `encrypted: true`, but this initial implementation uploads the JPEG to Matrix without per-attachment encryption because the pinned Matrix SDK 0.5 lacks encrypted media upload support. This is appropriate only for public imagery such as retailer product photos.
 

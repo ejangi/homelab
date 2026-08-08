@@ -751,7 +751,10 @@ async fn fetch_and_resize_public_image(
 }
 
 fn is_allowed_image_host(host: Option<&str>) -> bool {
-    matches!(host, Some("cdn.shopify.com") | Some("res.cloudinary.com"))
+    matches!(
+        host,
+        Some("cdn.shopify.com") | Some("res.cloudinary.com") | Some("i.gr-assets.com")
+    )
 }
 
 #[derive(sqlx::FromRow)]
@@ -992,6 +995,7 @@ mod tests {
     fn public_image_hosts_are_explicitly_allowlisted() {
         assert!(is_allowed_image_host(Some("cdn.shopify.com")));
         assert!(is_allowed_image_host(Some("res.cloudinary.com")));
+        assert!(is_allowed_image_host(Some("i.gr-assets.com")));
         assert!(!is_allowed_image_host(Some("proton.me")));
         assert!(!is_allowed_image_host(Some("res.cloudinary.com.example.com")));
     }
