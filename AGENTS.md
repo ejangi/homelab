@@ -27,6 +27,19 @@ Use the API only when the task calls for changing or inspecting the n8n
 instance. Never place the key in workflow JSON, source files, or command
 arguments.
 
+## Workflow deduplication
+
+When a workflow needs to distinguish newly discovered items from items it has
+already processed, use an n8n data table to persist the stable item identifier
+and relevant delivery metadata. Check the table before delivery and record the
+item only after the downstream action succeeds, so retries remain safe.
+
+## Operator time zone
+
+The operator is in the `Australia/Brisbane` time zone. When Matrix messages
+include a date or time, format it in `Australia/Brisbane` unless the task
+specifies another time zone.
+
 ## Matrix notifications
 
 When changing the Matrix Service or the Matrix Sender Workflow, read
