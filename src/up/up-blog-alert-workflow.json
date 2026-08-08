@@ -1,0 +1,339 @@
+{
+  "name": "Up blog alerts",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      },
+      "id": "0c4a8bb9-7a42-4ef9-8a53-6a03a77ab9d0",
+      "name": "Every day at 7 AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -920,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://up.com.au/blog/feed.xml",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "6d83723e-0f18-48f9-9e7e-e65f7a76e0bf",
+      "name": "Fetch Up RSS feed",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1,
+      "position": [
+        -680,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function requestIdFor(value) {\n  let hash = 5381;\n  for (const character of value) {\n    hash = ((hash << 5) + hash) ^ character.charCodeAt(0);\n  }\n  return `up-blog-${(hash >>> 0).toString(36)}`;\n}\n\nfunction formatInBrisbane(date) {\n  return new Intl.DateTimeFormat('en-AU', {\n    timeZone: 'Australia/Brisbane',\n    day: '2-digit',\n    month: 'short',\n    year: 'numeric',\n  }).format(date);\n}\n\nfunction escapeMarkdown(value) {\n  return value.replace(/([\\\\`*_{}[\\]<>])/g, '\\\\$1');\n}\n\nreturn $input.all().flatMap((item) => {\n  const post = item.json;\n  const postUrl = typeof post.link === 'string' ? post.link.trim() : '';\n  const postId = String(post.guid ?? postUrl).trim();\n  const title = String(post.title ?? '').trim();\n  // rss-parser exposes RSS <description> as content/contentSnippet.\n  const summary = String(post.content ?? post.contentSnippet ?? post.description ?? '').trim();\n\n  if (!postId || !postUrl || !title || !summary) {\n    return [];\n  }\n\n  const published = new Date(post.isoDate ?? post.pubDate ?? '');\n  const publishedAt = Number.isNaN(published.valueOf()) ? null : published.toISOString();\n  const publishedInBrisbane = publishedAt ? formatInBrisbane(published) : null;\n\n  return [{\n    json: {\n      post_id: postId,\n      title,\n      summary,\n      post_url: postUrl,\n      published_at: publishedAt,\n      first_seen_at: new Date().toISOString(),\n      message: [\n        '🏦 **New Up blog post**',\n        '',\n        `**${escapeMarkdown(title)}**`,\n        publishedInBrisbane ? `Published: ${publishedInBrisbane}` : null,\n        '',\n        summary,\n        '',\n        `[Read the full article](${postUrl})`,\n      ].filter((line) => line !== null).join('\\n'),\n      matrix_request_id: requestIdFor(postId),\n    },\n  }];\n});"
+      },
+      "id": "724a1d26-f2dc-412d-b9cf-506f31cbe9cc",
+      "name": "Prepare Up blog posts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -420,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "rowNotExists",
+        "dataTableId": {
+          "__rl": true,
+          "value": "9kl0UkznL990f8wX",
+          "mode": "list",
+          "cachedResultName": "Up Blog Posts"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "post_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.post_id }}"
+            }
+          ]
+        }
+      },
+      "id": "b015ee42-ca57-4c3f-901c-f56b4798bb69",
+      "name": "Only new Up blog posts",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        -160,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "wv07Z6jDBKWlgksk",
+          "mode": "list",
+          "cachedResultName": "Matrix Sender"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "message": "={{ $json.message }}",
+            "format": "markdown",
+            "encrypted": true,
+            "request_id": "={{ $json.matrix_request_id }}"
+          },
+          "schema": [
+            {
+              "id": "message",
+              "displayName": "message",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "room_id",
+              "displayName": "room_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "format",
+              "displayName": "format",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "encrypted",
+              "displayName": "encrypted",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "request_id",
+              "displayName": "request_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "mode": "each",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "aee6a183-565d-4e79-a722-5daea87f52d2",
+      "name": "Send Matrix notification",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        100,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const post = $('Prepare Up blog posts').item.json;\n\nreturn {\n  json: {\n    post_id: post.post_id,\n    title: post.title,\n    summary: post.summary,\n    post_url: post.post_url,\n    published_at: post.published_at,\n    first_seen_at: post.first_seen_at,\n    matrix_event_id: $json.event_id ?? null,\n  },\n};"
+      },
+      "id": "26c1d0d8-b3a0-48ed-a3d1-5edc98e37d1b",
+      "name": "Prepare seen Up blog post record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        360,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "value": "9kl0UkznL990f8wX",
+          "mode": "list",
+          "cachedResultName": "Up Blog Posts"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "schema": [
+            {
+              "id": "post_id",
+              "displayName": "post_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "title",
+              "displayName": "title",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "summary",
+              "displayName": "summary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "post_url",
+              "displayName": "post_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "published_at",
+              "displayName": "published_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "date",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "first_seen_at",
+              "displayName": "first_seen_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "date",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "matrix_event_id",
+              "displayName": "matrix_event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "bf3ccdc1-fc78-4a26-8430-0fb7b5f910e6",
+      "name": "Record seen Up blog post",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        620,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Every day at 7 AM": {
+      "main": [
+        [
+          {
+            "node": "Fetch Up RSS feed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Up RSS feed": {
+      "main": [
+        [
+          {
+            "node": "Prepare Up blog posts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Up blog posts": {
+      "main": [
+        [
+          {
+            "node": "Only new Up blog posts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Only new Up blog posts": {
+      "main": [
+        [
+          {
+            "node": "Send Matrix notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Matrix notification": {
+      "main": [
+        [
+          {
+            "node": "Prepare seen Up blog post record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare seen Up blog post record": {
+      "main": [
+        [
+          {
+            "node": "Record seen Up blog post",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Australia/Brisbane"
+  }
+}

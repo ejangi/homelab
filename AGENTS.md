@@ -52,6 +52,12 @@ Matrix secrets (`MATRIX_PASSWORD`, `MATRIX_STORE_ENCRYPTION_KEY`, and
 source files, workflow JSON, command arguments, and logs. Run Matrix Service
 migrations through Docker Compose, not manually against the database.
 
+## Matrix workflow previews
+
+After creating or changing an n8n workflow that delivers Matrix notifications,
+send one representative message through that workflow at the end of development.
+The operator uses this preview to check the delivered message format.
+
 ## DONKI CME alerts
 
 `src/donki/` contains the checked-in workflow definition for DONKI
