@@ -25,4 +25,19 @@ ejangi-nix.bobtail-morpho.ts.net, localhost:8080 {
         reverse_proxy matrix:8787
     }
 
+    # SFTPGo's WebAdmin and WebClient are configured with /files as their web
+    # root. The REST API is intentionally retained at its native /api/v2 path.
+    handle /files {
+        # `*` prevents Caddy treating the destination as a path matcher.
+        redir * /files/web/client 302
+    }
+
+    handle /files/* {
+        reverse_proxy sftpgo:8080
+    }
+
+    handle /api/v2/* {
+        reverse_proxy sftpgo:8080
+    }
+
 }

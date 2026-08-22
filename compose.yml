@@ -144,6 +144,71 @@ services:
     command:
       ["sh", "-c", "while true; do /usr/local/bin/backup.sh; sleep 86400; done"]
 
+  # 5. SFTPGO SERVICE
+  # SFTPGo provides the web file UI at /files and stores its configuration in
+  # the existing PostgreSQL database. A table prefix keeps its tables isolated
+  # from n8n while retaining the existing nightly PostgreSQL backup coverage.
+  sftpgo:
+    image: drakkan/sftpgo:v2.7.1-alpine
+    container_name: sftpgo
+    restart: unless-stopped
+    environment:
+      SFTPGO_DATA_PROVIDER__DRIVER: postgresql
+      SFTPGO_DATA_PROVIDER__HOST: postgres
+      SFTPGO_DATA_PROVIDER__PORT: "5432"
+      SFTPGO_DATA_PROVIDER__NAME: ${POSTGRES_DB}
+      SFTPGO_DATA_PROVIDER__USERNAME: ${POSTGRES_USER}
+      SFTPGO_DATA_PROVIDER__PASSWORD: ${POSTGRES_PASSWORD}
+      SFTPGO_DATA_PROVIDER__SSLMODE: "0"
+      SFTPGO_DATA_PROVIDER__SQL_TABLES_PREFIX: sftpgo_
+      SFTPGO_DATA_PROVIDER__CREATE_DEFAULT_ADMIN: "true"
+      SFTPGO_DEFAULT_ADMIN_USERNAME: ${SFTPGO_ADMIN_USERNAME:-admin}
+      SFTPGO_DEFAULT_ADMIN_PASSWORD: ${SFTPGO_ADMIN_PASSWORD:?Set SFTPGO_ADMIN_PASSWORD in .env before starting SFTPGo}
+      # Keep all WebAdmin and WebClient routes beneath the existing hostname's
+      # /files prefix. The REST API itself remains /api/v2, which Caddy proxies.
+      SFTPGO_HTTPD__WEB_ROOT: /files
+      SFTPGO_HTTPD__BINDINGS__0__BASE_URL: https://${N8N_HOST}/files
+      SFTPGO_HTTPD__BINDINGS__0__PROXY_ALLOWED: ${NETWORK_SUBNET}
+      SFTPGO_HTTPD__BINDINGS__0__CLIENT_IP_PROXY_HEADER: X-Forwarded-For
+      # This setup exposes the web file client only. SFTP can be enabled later
+      # with a deliberate host-port and firewall policy.
+      SFTPGO_SFTPD__BINDINGS__0__PORT: "0"
+    volumes:
+      - ${ICLOUD_DRIVE_DIR:-/home/ejangi/iCloud Drive}:/srv/sftpgo/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "sftpgo", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - n8n_backend
+
+  # 6. SAMBA SERVICE
+  # Apple Files connects to SMB shares directly, whereas SFTPGo's /files route
+  # is a browser UI. This exposes the same iCloud Drive bind mount as an
+  # authenticated SMB share without making it available anonymously.
+  samba:
+    image: dockurr/samba:4.23.10
+    container_name: n8n_samba
+    restart: unless-stopped
+    environment:
+      NAME: iCloudDrive
+      USER: files
+      PASS: ${SMB_PASSWORD:?Set SMB_PASSWORD in .env before starting Samba}
+      # These match the owner of the iCloud Drive directory on the host so
+      # files created through SMB retain the expected ownership.
+      UID: "1000"
+      GID: "1000"
+    ports:
+      # SMB is a separate protocol from the HTTPS /files route.
+      - "445:445/tcp"
+    volumes:
+      - ${ICLOUD_DRIVE_DIR:-/home/ejangi/iCloud Drive}:/shared
+
 # Volume & Network Definition
 volumes:
   n8n_data:
