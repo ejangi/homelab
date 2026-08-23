@@ -753,7 +753,10 @@ async fn fetch_and_resize_public_image(
 fn is_allowed_image_host(host: Option<&str>) -> bool {
     matches!(
         host,
-        Some("cdn.shopify.com") | Some("res.cloudinary.com") | Some("i.gr-assets.com")
+        Some("cdn.shopify.com")
+            | Some("images.puma.com")
+            | Some("res.cloudinary.com")
+            | Some("i.gr-assets.com")
     )
 }
 
@@ -934,8 +937,14 @@ async fn main() -> Result<()> {
         send_lock: Mutex::new(()),
     };
 
-    if let Err(error) = state.bootstrap().await {
-        warn!(error = ?error, "Matrix client bootstrap did not complete; use the setup endpoint to retry");
+    match tokio::time::timeout(Duration::from_secs(30), state.bootstrap()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            warn!(error = ?error, "Matrix client bootstrap did not complete; use the setup endpoint to retry");
+        }
+        Err(_) => {
+            warn!("Matrix client bootstrap timed out; use the setup endpoint to retry");
+        }
     }
 
     rocket::build()
@@ -994,6 +1003,7 @@ mod tests {
     #[test]
     fn public_image_hosts_are_explicitly_allowlisted() {
         assert!(is_allowed_image_host(Some("cdn.shopify.com")));
+        assert!(is_allowed_image_host(Some("images.puma.com")));
         assert!(is_allowed_image_host(Some("res.cloudinary.com")));
         assert!(is_allowed_image_host(Some("i.gr-assets.com")));
         assert!(!is_allowed_image_host(Some("proton.me")));
