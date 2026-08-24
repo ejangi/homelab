@@ -1,1 +1,4 @@
 backups/*.dump
+
+# Tailscale-issued TLS certificate and private key used by Caddy.
+caddy/tailscale-certs/

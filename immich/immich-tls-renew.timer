@@ -1,0 +1,9 @@
+[Unit]
+Description=Check the Tailscale TLS certificate weekly
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+
+[Install]
+WantedBy=timers.target

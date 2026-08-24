@@ -70,3 +70,13 @@ Earth-directed CME alerts. The workflow polls DONKI, deduplicates delivered
 reports with the `DONKI CME Reports` n8n data table, and calls the Matrix Sender
 Workflow for notifications. Keep its Matrix delivery inputs secret-free and
 update the checked-in JSON whenever the imported n8n workflow changes.
+
+# Docker Compose
+
+Use `<root>/compose.yml` environment for all services (don't create new docker compose environments unless absolutely necessary). You can also reuse the postgres database where needed as well. We are looking to reuse services as much as possible. Similarly, can we keep environment variables in the `<root>/.env` file where possible?
+
+This service already has a backup solution for the postgres database. 
+
+The <root>/compose.yml file also hasa a `caddy/Caddyfile` setup that assists with redirects, proxying and tailscale certificates. Reuse that where possible please.
+
+Keep your reusable scripts in the `scripts/` directory and documentation in the `docs/` directory please. Again, try to reuse existing documents unless you feel they will get needlessly long - then create a new doc and link it from existing docs and/or the README.md file please.

@@ -1,0 +1,20 @@
+[Unit]
+Description=Immich photo library
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ejangi/Sites/n8n
+# The mount is manually unlocked. Refuse to start until it is genuinely mounted,
+# rather than letting Docker ever create directories on the root filesystem.
+ExecStartPre=/usr/bin/mountpoint -q /mnt/Photos
+ExecStart=/usr/bin/docker compose up immich_server immich_machine_learning immich_postgres_backup
+ExecStop=/usr/bin/docker compose stop immich_server immich_machine_learning immich_postgres_backup immich_database immich_redis
+Restart=on-failure
+RestartSec=60
+TimeoutStartSec=0
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

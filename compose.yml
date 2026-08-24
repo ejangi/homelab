@@ -111,11 +111,15 @@ services:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       # Volume for Caddy's data (including SSL certificates)
       - caddy_data:/data
+      # Trusted certificate issued by the local Tailscale client. The private
+      # key is deliberately ignored by Git and readable only by its owner.
+      - ./caddy/tailscale-certs:/etc/caddy/tailscale-certs:ro
     depends_on:
       - n8n
       - matrix
     networks:
       - n8n_backend
+      - immich_proxy
 
   # 4. POSTGRES BACKUP SERVICE
   postgres_backup:
@@ -141,6 +145,34 @@ services:
         condition: service_healthy # Ensure postgres is up and ready
     networks:
       - n8n_backend
+    command:
+      ["sh", "-c", "while true; do /usr/local/bin/backup.sh; sleep 86400; done"]
+
+  # 4.5 IMMICH DATABASE BACKUP SERVICE
+  # Immich requires its own PostgreSQL image for its vector extensions, so it
+  # stays isolated from the n8n database while using the same backup directory
+  # and retention policy. Its lifecycle is guarded by the Immich user service
+  # because its data volume is manually unlocked.
+  immich_postgres_backup:
+    image: postgres:15-alpine
+    container_name: immich_postgres_backup
+    restart: "no"
+    environment:
+      - PGHOST=immich_database
+      - PGPORT=5432
+      - BACKUP_LABEL=immich
+      - BACKUP_DATABASE=${IMMICH_DB_DATABASE_NAME}
+      - BACKUP_USER=${IMMICH_DB_USERNAME}
+      - DB_PASSWORD=${IMMICH_DB_PASSWORD}
+      - BACKUP_DIR=/backups
+    volumes:
+      - ./backups:/backups
+      - ./scripts/backup.sh:/usr/local/bin/backup.sh:ro
+    depends_on:
+      immich_database:
+        condition: service_healthy
+    networks:
+      - immich_backend
     command:
       ["sh", "-c", "while true; do /usr/local/bin/backup.sh; sleep 86400; done"]
 
@@ -209,6 +241,98 @@ services:
     volumes:
       - ${ICLOUD_DRIVE_DIR:-/home/ejangi/iCloud Drive}:/shared
 
+  # 7. IMMICH PHOTO SERVICE
+  # Originals are an external, read-only library. All Immich-managed data is
+  # stored on the encrypted /mnt/Photos volume.
+  immich_server:
+    container_name: immich_server
+    image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION}
+    volumes:
+      - type: bind
+        source: ${IMMICH_UPLOAD_LOCATION}
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${IMMICH_EXTERNAL_LIBRARY_LOCATION}
+        target: /external-library
+        read_only: true
+        bind:
+          create_host_path: false
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      DB_PASSWORD: ${IMMICH_DB_PASSWORD}
+      DB_USERNAME: ${IMMICH_DB_USERNAME}
+      DB_DATABASE_NAME: ${IMMICH_DB_DATABASE_NAME}
+      DB_HOSTNAME: ${IMMICH_DB_HOSTNAME}
+      REDIS_HOSTNAME: ${IMMICH_REDIS_HOSTNAME}
+      TZ: ${TZ}
+    depends_on:
+      immich_redis:
+        condition: service_started
+      immich_database:
+        condition: service_healthy
+    networks:
+      - immich_backend
+      - immich_proxy
+    restart: "no"
+    healthcheck:
+      disable: false
+
+  immich_machine_learning:
+    container_name: immich_machine_learning
+    # ROCm is intentionally not enabled yet: its large image could not be
+    # unpacked on the system disk. See immich/README.md for the next step.
+    image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_VERSION}
+    volumes:
+      - type: bind
+        source: ${IMMICH_MODEL_CACHE_LOCATION}
+        target: /cache
+        bind:
+          create_host_path: false
+    environment:
+      TZ: ${TZ}
+    networks:
+      immich_backend:
+        aliases:
+          # Immich's default ML URL uses this conventional hostname.
+          - immich-machine-learning
+    restart: "no"
+    healthcheck:
+      disable: false
+
+  immich_redis:
+    container_name: immich_redis
+    image: docker.io/valkey/valkey:9@sha256:8e8d64b405ce18f41b8e5ee20aa4687a8ed0022d1298f2ce31cdcf3a76e09411
+    healthcheck:
+      test: redis-cli ping || exit 1
+    networks:
+      - immich_backend
+    restart: "no"
+
+  immich_database:
+    container_name: immich_postgres
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0@sha256:bcf63357191b76a916ae5eb93464d65c07511da41e3bf7a8416db519b40b1c23
+    environment:
+      POSTGRES_PASSWORD: ${IMMICH_DB_PASSWORD}
+      POSTGRES_USER: ${IMMICH_DB_USERNAME}
+      POSTGRES_DB: ${IMMICH_DB_DATABASE_NAME}
+      POSTGRES_INITDB_ARGS: '--data-checksums'
+      # The encrypted photo volume is on a secondary HDD.
+      DB_STORAGE_TYPE: HDD
+    volumes:
+      - type: bind
+        source: ${IMMICH_DB_DATA_LOCATION}
+        target: /var/lib/postgresql/data
+        bind:
+          create_host_path: false
+    shm_size: 128mb
+    networks:
+      - immich_backend
+    restart: "no"
+    healthcheck:
+      disable: false
+
 # Volume & Network Definition
 volumes:
   n8n_data:
@@ -222,3 +346,9 @@ networks:
       driver: default
       config:
         - subnet: ${NETWORK_SUBNET}
+  # Shared only by Caddy and the Immich web server.
+  immich_proxy:
+    driver: bridge
+  # Private network for the Immich application, database, Redis, and backup.
+  immich_backend:
+    driver: bridge
