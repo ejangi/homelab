@@ -26,12 +26,15 @@
     {
       "parameters": {
         "url": "https://goodreads-genres-api-493965641883.australia-southeast1.run.app/?genres=science-fiction&sort_by=avg&min_avg=4.2&min_count=8000",
-        "options": { "timeout": 30000 }
+        "options": { "timeout": 120000 }
       },
       "id": "b3aec92a-09e7-4ee4-a9c9-cf6f6af6bde9",
       "name": "Fetch Goodreads science-fiction books",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.5,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 10000,
       "position": [-680, 0]
     },
     {
