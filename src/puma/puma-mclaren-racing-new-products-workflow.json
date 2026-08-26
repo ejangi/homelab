@@ -445,6 +445,7 @@
   },
   "settings": {
     "executionOrder": "v1",
-    "timezone": "Australia/Brisbane"
+    "timezone": "Australia/Brisbane",
+    "errorWorkflow": "fOszDr3Us7EmONPm"
   }
 }

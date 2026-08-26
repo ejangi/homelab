@@ -36,6 +36,11 @@ services:
       # Internal Matrix notification service
       - MATRIX_SERVICE_URL=${MATRIX_SERVICE_URL}
       - MATRIX_SERVICE_API_KEY=${MATRIX_SERVICE_API_KEY}
+      # Authenticated host-local service that publishes desktop notifications
+      # into the operator's GNOME session. It is reachable only through the
+      # private Docker bridge gateway, not a published container port.
+      - GNOME_NOTIFICATION_SERVICE_URL=${GNOME_NOTIFICATION_SERVICE_URL}
+      - GNOME_NOTIFICATION_SERVICE_API_KEY=${GNOME_NOTIFICATION_SERVICE_API_KEY}
       # Change N8N_SECURE_COOKIE to true as we are using HTTPS
       - N8N_SECURE_COOKIE=${N8N_SECURE_COOKIE}
       - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
@@ -72,6 +77,34 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+    networks:
+      - n8n_backend
+
+  # Delivers authenticated, internal n8n requests to the operator's GNOME
+  # session. Its port remains private to the n8n Docker network.
+  gnome-notifier:
+    build:
+      context: .
+      dockerfile: src/gnome-notifier/Dockerfile
+    container_name: n8n_gnome_notifier
+    restart: unless-stopped
+    user: "1000:1000"
+    environment:
+      - DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+      - GNOME_NOTIFICATION_SERVICE_API_KEY=${GNOME_NOTIFICATION_SERVICE_API_KEY}
+      - N8N_GNOME_NOTIFY_BIND_ADDRESS=0.0.0.0
+      - N8N_GNOME_NOTIFY_PORT=8788
+    volumes:
+      - type: bind
+        source: /run/user/1000/bus
+        target: /run/user/1000/bus
+        read_only: true
+    healthcheck:
+      test: ["CMD", "python3", "-c", "from urllib.request import urlopen; assert urlopen('http://127.0.0.1:8788/healthz').status == 200"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
     networks:
       - n8n_backend
 

@@ -1,0 +1,88 @@
+{
+  "name": "n8n execution failure notifications",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "99bc4b0c-9f4f-4271-9538-7eea849cdd21",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const execution = $json.execution ?? {};\nconst workflow = $json.workflow ?? {};\nconst error = execution.error ?? {};\n\nconst workflowName = workflow.name || 'Unknown workflow';\nconst failedNode = execution.lastNodeExecuted || 'Unknown node';\nconst message = error.message || 'No error message was supplied.';\nconst executionUrl = execution.url || '';\n\nreturn {\n  json: {\n    title: `n8n failed: ${workflowName}`,\n    body: [`Node: ${failedNode}`, `Error: ${message}`, executionUrl].filter(Boolean).join('\\n'),\n    urgency: 'critical',\n  },\n};"
+      },
+      "id": "21aa92eb-7e46-45b9-adf6-b36e413ab4d1",
+      "name": "Prepare desktop notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.GNOME_NOTIFICATION_SERVICE_URL }}/v1/notifications",
+        "authentication": "none",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.GNOME_NOTIFICATION_SERVICE_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "32d119a8-11b2-4816-938d-c50a06b8c9b8",
+      "name": "Send GNOME notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        480,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Prepare desktop notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare desktop notification": {
+      "main": [
+        [
+          {
+            "node": "Send GNOME notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

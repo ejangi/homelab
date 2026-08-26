@@ -163,5 +163,5 @@
     "Send Matrix notification": { "main": [[{ "node": "Prepare seen Goodreads book record", "type": "main", "index": 0 }]] },
     "Prepare seen Goodreads book record": { "main": [[{ "node": "Record seen Goodreads book", "type": "main", "index": 0 }]] }
   },
-  "settings": { "executionOrder": "v1", "timezone": "Australia/Brisbane" }
+  "settings": { "executionOrder": "v1", "timezone": "Australia/Brisbane", "errorWorkflow": "fOszDr3Us7EmONPm" }
 }
