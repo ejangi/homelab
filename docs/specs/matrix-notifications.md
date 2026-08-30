@@ -2,11 +2,11 @@
 
 ## Purpose
 
-Provide one reusable, authenticated way for n8n workflows to post Matrix notifications. The Matrix Service owns Matrix authentication and all client-side encryption state; callers provide only message content and delivery options.
+Provide one reusable, authenticated way for n8n workflows to post Matrix notifications. The Matrix Service owns Matrix authentication and all client-side encryption state; callers provide only message content and delivery options. A separate Matrix account acts as a continuously synchronized encrypted-delivery monitor.
 
 ## Scope
 
-The service supports one Matrix account, text messages, Markdown, HTML, optional plaintext delivery, idempotent retries, and Matrix end-to-end encryption for any room that the configured Matrix account has joined and may post to. It can also attach a resized public product or book-cover image.
+The service supports a Matrix sender account plus a separate delivery-monitor account, text messages, Markdown, HTML, optional plaintext delivery, idempotent retries, and Matrix end-to-end encryption for any room that the configured sender account has joined and may post to. It can also attach a resized public product or book-cover image.
 
 It does not support arbitrary attachments, reactions, replies, inbound Matrix event processing, room creation, or arbitrary Matrix event types.
 
@@ -14,15 +14,16 @@ It does not support arbitrary attachments, reactions, replies, inbound Matrix ev
 
 | Component | Responsibility |
 | --- | --- |
-| `matrix` service | Matrix login, device lifecycle, sync, E2EE, formatting, delivery, persistence, setup, and API-key authentication. |
-| Postgres | Matrix SDK state and crypto store, service migrations, delivery idempotency records, and audit metadata. |
+| `matrix` service | Matrix login, sender and monitor device lifecycle, sync, E2EE, formatting, delivery, receipt persistence, setup, and API-key authentication. |
+| Postgres | Service migrations, delivery idempotency records, monitor receipts, and delivery-failure audit metadata. |
+| `matrix_store` volume | Encrypted maintained-SDK SQLite state for the sender and monitor devices. |
 | Matrix Sender Workflow | n8n sub-workflow that exposes a typed caller contract and invokes the service. |
 | Caddy | Proxies the protected setup UI at `/matrix/`; it does not expose the container port directly. |
 
 ## Architecture decisions
 
 - Implement the service in Rust using Rocket and the Matrix Rust SDK.
-- Use the Matrix Rust SDK with its compatible `matrix-sdk-sql` Postgres store for Matrix state and encrypted crypto state. Do not implement Olm, Megolm, or Matrix device-key handling directly. The available Postgres-store integration currently pins Matrix SDK 0.5; track its maintenance and upgrade it as a single compatibility unit.
+- Use the maintained Matrix Rust SDK and its encrypted SQLite store for Matrix state and crypto state. Do not implement Olm, Megolm, or Matrix device-key handling directly.
 - The service runs continuously so it can synchronize room and device state.
 - The service listens on port `8787` inside the Compose network. n8n reaches it at `http://matrix:8787`.
 - Do not publish port `8787` directly on the host. Caddy may proxy `/matrix/` to make setup available from the local n8n endpoint and Tailnet hostname.
@@ -38,6 +39,8 @@ The Compose environment provides these values to the `matrix` service. n8n recei
 | `MATRIX_HOMESERVER_URL` | Yes | Matrix homeserver base URL; initially `https://matrix.org`. |
 | `MATRIX_USER_ID` | Yes | Service account user ID; initially `@ejangi-integrations:matrix.org`. |
 | `MATRIX_PASSWORD` | Yes | Matrix account password. It must never be committed, logged, returned, or included in workflow JSON. |
+| `MATRIX_MONITOR_USER_ID` | Yes | Matrix account used to independently decrypt delivery-monitor events. This may be a dedicated monitor account or the recipient's own account. It must be joined to the notification room. |
+| `MATRIX_MONITOR_PASSWORD` | Yes | Delivery-monitor account password. It must never be committed, logged, returned, or included in workflow JSON. |
 | `MATRIX_DEFAULT_ROOM_ID` | Yes | Fallback room ID: `!gGNQxnBRzxaGuIcEzJ:matrix.org`. |
 | `MATRIX_SERVICE_API_KEY` | Yes | Shared internal API key for n8n and the service. |
 | `MATRIX_STORE_ENCRYPTION_KEY` | Yes | Separate secret used to encrypt the Matrix crypto store at rest. |
@@ -51,7 +54,7 @@ The operator backs up `.env` and its secrets separately. A database backup alone
 
 ### Bootstrap
 
-At service startup, the service logs in using the configured account, restores the persistent Matrix client device where possible, initializes the crypto store, uploads any required device keys, and starts synchronization. Startup gives this bootstrap 30 seconds so the health endpoint remains available during an upstream Matrix outage; `POST /v1/setup/bootstrap` retries the operation if startup bootstrap did not complete.
+At service startup, the service logs in using the configured sender and monitor accounts, restores their persistent Matrix client devices where possible, initializes separate crypto stores, uploads any required device keys, and starts synchronization. The monitor account must have joined the default notification room; otherwise setup remains incomplete and reports that membership requirement in the service log. The monitor SDK schema, encryption key derivation, and persisted device ID are identity-scoped: changing `MATRIX_MONITOR_USER_ID` creates a new device and never attempts to reuse another account's crypto store. Startup gives this bootstrap 30 seconds so the health endpoint remains available during an upstream Matrix outage; `POST /v1/setup/bootstrap` retries the operation if startup bootstrap did not complete.
 
 If both the service and SDK state are absent (for example, a new deployment without a restored database), bootstrap creates a new Matrix device. The resulting device cannot decrypt history encrypted for a previously lost device.
 
@@ -61,11 +64,13 @@ The service must never enable encryption as a side effect of a delivery request.
 
 `POST /v1/setup/rooms/{room_id}/enable-encryption` requires an explicit confirmation payload. It checks that the service account is joined to the room and has sufficient power to send the room encryption state event, then enables Matrix E2EE for that room.
 
+`POST /v1/setup/rooms/{room_id}/rotate-encryption-session` requires an explicit `{"confirm": true}` payload and invalidates the active outbound Megolm session through the Matrix SDK. It is an operator recovery action for an unreadable newly-sent event, not a routine delivery operation. The endpoint requires the service account to be joined to an encrypted room; the next encrypted message establishes a fresh session without a service restart. It never edits Matrix crypto-store rows directly.
+
 For an encrypted delivery request targeting an unencrypted room, the service returns `ROOM_ENCRYPTION_REQUIRED`. The caller or operator must explicitly enable the room first. Plaintext delivery remains available only when the caller chooses it explicitly.
 
 ### Verification
 
-The protected setup UI is available at `/matrix/setup` and contains the explicit encryption-enable action. Device verification is not a delivery prerequisite: encrypted messages are sent using the configured SDK policy, which allows unverified devices. A user-facing SAS/QR verification ceremony is deferred from this first release because the delivery policy deliberately does not require verified devices.
+The protected setup UI is available at `/matrix/setup` and contains the explicit encryption-enable and session-rotation actions. `POST /v1/setup/monitor/request-verification` sends standard Matrix verification requests from the monitor device to every other current device on `MATRIX_MONITOR_USER_ID`. This is an explicit operator action, not a delivery prerequisite: encrypted messages are sent using the configured SDK policy, which allows unverified devices.
 
 ## Delivery API
 
@@ -96,11 +101,12 @@ Rules:
 - `format` is `text`, `markdown`, or `html`; its default is `markdown`.
 - `encrypted` defaults to `true`.
 - `encrypted: true` requires that the room has Matrix encryption enabled. Failure to establish or share encryption state fails the request; no plaintext fallback is permitted.
-- `encrypted: false` sends a standard plaintext `m.room.message`, even if the room is encrypted. This must be explicit and is recorded in the response and audit metadata.
+- For encrypted delivery, success also requires the separate monitor device to receive and decrypt the returned Matrix event within 45 seconds. On the first timeout, the service records the failure, discards that room's outbound session, and retries the text event once with a new session. A second timeout returns `MATRIX_MONITOR_DECRYPT_TIMEOUT` and leaves an idempotent request incomplete so the caller may retry safely.
+- `encrypted: false` sends a standard plaintext `m.room.message` only to an unencrypted room. It is refused for encrypted rooms so the SDK can never silently encrypt or downgrade a caller's explicit mode.
 - `request_id` is optional. When supplied, it is an idempotency key scoped to the effective room and request payload.
 - `image_url` is optional. It must be an HTTPS URL on an approved public image CDN (`cdn.shopify.com` for Rushfaster product images, `images.puma.com` for PUMA product images, `res.cloudinary.com` for Proton Blog images, or `i.gr-assets.com` for Goodreads book covers); the service downloads at most 10 MiB, resizes it to fit within 256 × 256 pixels while preserving aspect ratio, encodes it as JPEG, uploads it to Matrix, and sends an `m.image` event before the text message. Redirects are not followed.
 - `image_alt` is optional alt text for the image event; it defaults to `Image attachment`.
-- The image event is encrypted as a Matrix event when `encrypted: true`, but this initial implementation uploads the JPEG to Matrix without per-attachment encryption because the pinned Matrix SDK 0.5 lacks encrypted media upload support. This is appropriate only for public imagery such as retailer product photos.
+- The image event is encrypted as a Matrix event when `encrypted: true`. Public product imagery is uploaded as standard Matrix media, so it remains appropriate only for public imagery such as retailer product photos.
 
 Successful response:
 
@@ -126,7 +132,7 @@ Failure response:
 }
 ```
 
-The API returns stable machine-readable errors for invalid input, unauthorized API access, missing setup, unencrypted-room refusal, and idempotency conflicts. Other Matrix or transport failures are returned as `MATRIX_DELIVERY_FAILED` without exposing internal details.
+The API returns stable machine-readable errors for invalid input, unauthorized API access, missing setup, unencrypted-room refusal, idempotency conflicts, and `MATRIX_MONITOR_DECRYPT_TIMEOUT`. Other Matrix or transport failures are returned as `MATRIX_DELIVERY_FAILED` without exposing internal details.
 
 ## Formatting
 
@@ -145,6 +151,9 @@ For encrypted messages, the Matrix SDK manages device queries, Olm sessions, Meg
 - return `excluded_device_count: 0` in the initial release because the SDK does not expose a reliable per-send exclusion count;
 - serialize crypto mutations so concurrent delivery requests cannot corrupt Matrix crypto state;
 - fail the delivery request if no eligible recipient devices can receive the room key.
+- run a separate monitor account and device with an isolated encrypted SDK store; after every encrypted text event it must persist a receipt only after the SDK has decrypted that event from the sender account. The HTTP delivery response is not successful until this receipt exists.
+
+The monitor proves that Matrix accepted the event and room-key share and that a fresh Matrix device decrypted the exact event. When configured with the recipient's own account it additionally tests key sharing to that account, but it still cannot import or inspect an Element client's private crypto store and cannot decrypt events from before that device joined. Matrix E2EE has no recipient-decryption acknowledgement protocol. This separates service-side E2EE failures (monitor timeout) from failures local to a recipient's Element device or its crypto store.
 
 ## Idempotency and cleanup
 
@@ -160,13 +169,15 @@ The service owns its tables and migrations. It must:
 
 - use a dedicated Postgres schema or consistently prefixed table names;
 - run versioned, forward-only migrations at startup under a Postgres advisory lock;
-- keep Matrix SDK storage and custom application storage in the existing Postgres database;
-- isolate the Matrix SDK SQL store in the `matrix_sdk` schema so its SQLx migration history cannot collide with the service's `matrix_service` migrations; install the idempotent outbound-session compatibility trigger required by the pinned beta adapter;
+- keep custom application storage in the existing Postgres database and Matrix SDK state in the encrypted `matrix_store` Docker volume;
+- isolate the sender SDK store from each deterministic monitor SDK-store directory, so their device keys and sync state cannot collide;
 - persist only operational metadata such as request hashes, event IDs, timestamps, error codes, and device-exclusion counts;
 - never persist Matrix passwords, API keys, or plaintext notification bodies in audit/idempotency tables;
-- use the Matrix SDK store-encryption mechanism with `MATRIX_STORE_ENCRYPTION_KEY` for private crypto material.
+- use the Matrix SDK store-encryption mechanism with `MATRIX_STORE_ENCRYPTION_KEY` for private sender crypto material, and derive a separate monitor-store key from it with a fixed service label.
 
-Existing Postgres backups must include all Matrix Service schemas and tables. Restore documentation must state that `MATRIX_STORE_ENCRYPTION_KEY` is also required.
+Existing Postgres backups must include the Matrix Service schema. `matrix_store_backup` creates an online, WAL-consistent SQLite archive daily and retains it locally for 30 days; the existing 1Password job uploads the newest archive off-host. The store is restored only with `scripts/restore-matrix-store.sh` while Matrix delivery is stopped. Restore documentation must state that `MATRIX_STORE_ENCRYPTION_KEY` is also required.
+
+The `n8n-backup-to-1password.timer` user timer runs daily at 00:20 in the operator's local time. It loads `OP_SERVICE_ACCOUNT_TOKEN` from the local `.env`; that 1Password service account must be able to edit the configured backup item. This non-interactive token is required for unattended off-host uploads. Without it, the timer leaves local backups untouched and exits successfully rather than waiting on a desktop authorization prompt.
 
 ## n8n Matrix Sender Workflow
 
@@ -208,4 +219,5 @@ The sub-workflow must not store the Matrix password, access token, device ID, cr
 9. Repeating a request with the same `request_id` returns the original Matrix event ID and creates no duplicate event.
 10. The service shares encrypted room keys with non-blocked devices regardless of verification status.
 11. After a restart, the service restores its persisted Matrix device and crypto state automatically; an operator can retry bootstrap through the protected setup API when startup bootstrap fails.
-12. Postgres backup and restore, paired with the separately backed-up store encryption key, restore the service's operational state.
+12. Postgres metadata backup plus a verified Matrix SQLite archive, paired with the separately backed-up store encryption key, restore the service's operational state.
+13. An encrypted delivery returns success only after the independent monitor device decrypts the exact Matrix event; a first monitor timeout automatically creates a replacement session and retries once, while a second timeout is reported as a retryable delivery failure.

@@ -1,18 +1,25 @@
-use std::{env, io::Cursor, sync::Arc, time::Duration};
+#![recursion_limit = "256"]
+
+use std::{env, fs, io::Cursor, path::{Path, PathBuf}, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, GenericImageView, ImageReader};
 use matrix_sdk::{
     config::SyncSettings,
-    room::Joined,
+    deserialized_responses::EncryptionInfo,
+    room::Room,
     ruma::{
-        api::client::message::send_message_event,
-        events::room::{message::{ImageMessageEventContent, MessageType, RoomMessageEventContent}, ImageInfo},
-        serde::Raw,
-        OwnedRoomId, OwnedTransactionId, UInt,
+        events::room::{
+            message::{
+                ImageMessageEventContent, MessageType, OriginalSyncRoomMessageEvent,
+                RoomMessageEventContent,
+            },
+            ImageInfo,
+        },
+        OwnedRoomId, OwnedTransactionId, OwnedUserId, UInt,
     },
-    Client,
+    Client, RoomState,
 };
 use pulldown_cmark::{html, Options, Parser};
 use rocket::{
@@ -26,22 +33,81 @@ use rocket::{
     State,
 };
 use sha2::{Digest, Sha256};
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx_core::{
+    pool::Pool,
+    postgres::{PgPoolOptions, Postgres},
+    query::query,
+    query_as::query_as,
+    query_scalar::query_scalar,
+};
 use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+type PgPool = Pool<Postgres>;
+
+async fn run_migrations(pool: &PgPool) -> Result<()> {
+    query("CREATE SCHEMA IF NOT EXISTS matrix_service")
+        .execute(pool)
+        .await
+        .context("creating Matrix Service schema")?;
+    query(
+        "CREATE TABLE IF NOT EXISTS matrix_service.service_migrations (version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+    )
+    .execute(pool)
+    .await
+    .context("creating Matrix Service migration ledger")?;
+
+    const MIGRATIONS: [(&str, &str); 5] = [
+        ("0001", include_str!("../migrations/0001_matrix_service.sql")),
+        ("0002", include_str!("../migrations/0002_matrix_sdk_schema.sql")),
+        ("0003", include_str!("../migrations/0003_matrix_delivery_monitor.sql")),
+        ("0004", include_str!("../migrations/0004_matrix_monitor_identity.sql")),
+        ("0005", include_str!("../migrations/0005_matrix_delivery_failures.sql")),
+    ];
+
+    for (version, sql) in MIGRATIONS {
+        let already_applied: bool = query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM matrix_service.service_migrations WHERE version = $1)",
+        )
+        .bind(version)
+        .fetch_one(pool)
+        .await
+        .context("checking Matrix Service migration ledger")?;
+        if already_applied {
+            continue;
+        }
+        // sqlx-core's prepared-statement API accepts one PostgreSQL command at
+        // a time. Service migrations deliberately contain only ordinary DDL
+        // (no function bodies), so splitting their statement terminators is
+        // safe and lets this small runner remain independent of sqlx macros.
+        for statement in sql.split(';').map(str::trim).filter(|statement| !statement.is_empty()) {
+            query(statement)
+                .execute(pool)
+                .await
+                .with_context(|| format!("applying Matrix Service migration {version}"))?;
+        }
+        query("INSERT INTO matrix_service.service_migrations (version) VALUES ($1)")
+            .bind(version)
+            .execute(pool)
+            .await
+            .with_context(|| format!("recording Matrix Service migration {version}"))?;
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 struct Config {
     homeserver_url: String,
     user_id: String,
     password: String,
+    monitor_user_id: String,
+    monitor_password: String,
     default_room_id: String,
     service_api_key: String,
     store_encryption_key: String,
+    store_dir: PathBuf,
     database_url: String,
     idempotency_retention_days: i64,
 }
@@ -52,9 +118,14 @@ impl Config {
             homeserver_url: required_env("MATRIX_HOMESERVER_URL")?,
             user_id: required_env("MATRIX_USER_ID")?,
             password: env::var("MATRIX_PASSWORD").unwrap_or_default(),
+            monitor_user_id: required_env("MATRIX_MONITOR_USER_ID")?,
+            monitor_password: required_env("MATRIX_MONITOR_PASSWORD")?,
             default_room_id: required_env("MATRIX_DEFAULT_ROOM_ID")?,
             service_api_key: required_env("MATRIX_SERVICE_API_KEY")?,
             store_encryption_key: required_env("MATRIX_STORE_ENCRYPTION_KEY")?,
+            store_dir: env::var("MATRIX_STORE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/matrix-store")),
             database_url: required_env("MATRIX_DATABASE_URL")?,
             idempotency_retention_days: env::var("MATRIX_IDEMPOTENCY_RETENTION_DAYS")
                 .ok()
@@ -68,64 +139,24 @@ fn required_env(name: &str) -> Result<String> {
     env::var(name).with_context(|| format!("{name} must be configured"))
 }
 
-fn database_url_with_search_path(database_url: &str, schema: &str) -> String {
-    let separator = if database_url.contains('?') { '&' } else { '?' };
-    format!("{database_url}{separator}options%5Bsearch_path%5D={schema}")
+fn monitor_store_directory(store_dir: &Path, user_id: &str) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(user_id.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    store_dir.join("monitor").join(&digest[..16])
 }
 
-async fn install_sdk_store_compatibility(pool: &PgPool) -> Result<()> {
-    // matrix-sdk-sql 0.1.0-beta.2 saves an outbound Megolm session with a
-    // plain INSERT even though a room has a single, replaceable session. Its
-    // own writes therefore fail on the second save. This trigger implements
-    // the intended update-or-insert behavior without modifying crypto data.
-    sqlx::query(
-        r#"
-        CREATE OR REPLACE FUNCTION matrix_sdk.replace_outbound_group_session()
-        RETURNS TRIGGER AS $$
-        BEGIN
-            UPDATE matrix_sdk.cryptostore_outbound_group_session
-            SET session_data = NEW.session_data
-            WHERE room_id = NEW.room_id;
-
-            IF FOUND THEN
-                RETURN NULL;
-            END IF;
-
-            RETURN NEW;
-        END;
-        $$ LANGUAGE plpgsql
-        "#,
-    )
-    .execute(pool)
-    .await
-    .context("creating Matrix SDK outbound-session compatibility function")?;
-
-    sqlx::query(
-        "DROP TRIGGER IF EXISTS replace_outbound_group_session ON matrix_sdk.cryptostore_outbound_group_session",
-    )
-    .execute(pool)
-    .await
-    .context("replacing Matrix SDK outbound-session compatibility trigger")?;
-
-    sqlx::query(
-        r#"
-        CREATE TRIGGER replace_outbound_group_session
-        BEFORE INSERT ON matrix_sdk.cryptostore_outbound_group_session
-        FOR EACH ROW EXECUTE FUNCTION matrix_sdk.replace_outbound_group_session()
-        "#,
-    )
-    .execute(pool)
-    .await
-    .context("creating Matrix SDK outbound-session compatibility trigger")?;
-
-    Ok(())
+fn joined_room(client: &Client, room_id: &OwnedRoomId) -> Option<Room> {
+    client
+        .get_room(room_id)
+        .filter(|room| room.state() == RoomState::Joined)
 }
 
 struct AppState {
     config: Config,
     pool: PgPool,
-    sdk_pool: Arc<PgPool>,
     client: RwLock<Option<Client>>,
+    monitor_client: RwLock<Option<Client>>,
     lifecycle_lock: Mutex<()>,
     send_lock: Mutex<()>,
 }
@@ -135,49 +166,46 @@ impl AppState {
         let _guard = self.lifecycle_lock.lock().await;
 
         if let Some(client) = self.client.read().await.clone() {
-            return Ok(self.setup_status(Some(client)).await);
+            let monitor_client = match self.monitor_client.read().await.clone() {
+                Some(monitor_client) => monitor_client,
+                None => self.bootstrap_monitor().await?,
+            };
+            *self.monitor_client.write().await = Some(monitor_client.clone());
+            return Ok(self.setup_status(Some(client), Some(monitor_client)).await);
         }
 
         if self.config.password.is_empty() {
-            return Err(anyhow!("MATRIX_PASSWORD is required before Matrix setup can run"));
+            return Err(anyhow!(
+                "MATRIX_PASSWORD is required before Matrix setup can run"
+            ));
         }
 
-        let store_config = matrix_sdk_sql::store_config(
-            &self.sdk_pool,
-            Some(self.config.store_encryption_key.as_str()),
-        )
-        .await
-        .context("opening Matrix Postgres store")?;
-        install_sdk_store_compatibility(&self.sdk_pool)
-            .await
-            .context("installing Matrix SDK Postgres compatibility")?;
-
+        let sender_store_dir = self.config.store_dir.join("sender");
+        fs::create_dir_all(&sender_store_dir)
+            .context("creating Matrix sender SQLite store directory")?;
         let client = Client::builder()
             .homeserver_url(self.config.homeserver_url.as_str())
-            .store_config(store_config)
+            .sqlite_store(&sender_store_dir, Some(self.config.store_encryption_key.as_str()))
             .build()
             .await
             .context("creating Matrix client")?;
 
-        let existing_device_id: Option<String> = sqlx::query_scalar(
-            "SELECT device_id FROM matrix_service.client_state WHERE singleton = TRUE",
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .context("loading Matrix device state")?;
-
-        let login_response = client
-            .login(
-                self.config.user_id.as_str(),
-                self.config.password.as_str(),
-                existing_device_id.as_deref(),
-                Some("n8n Matrix Service"),
-            )
-            .await
-            .context("logging into Matrix")?;
-
-        let device_id = login_response.device_id.to_string();
-        sqlx::query(
+        // The legacy Postgres crypto store is deliberately not reused. Passing
+        // its device ID to a new store would claim keys we no longer possess.
+        if !client.matrix_auth().logged_in() {
+            client
+                .matrix_auth()
+                .login_username(self.config.user_id.as_str(), self.config.password.as_str())
+                .initial_device_display_name("n8n Matrix Service")
+                .send()
+                .await
+                .context("logging into Matrix")?;
+        }
+        let device_id = client
+            .device_id()
+            .ok_or_else(|| anyhow!("Matrix sender login did not return a device ID"))?
+            .to_string();
+        query(
             "INSERT INTO matrix_service.client_state (singleton, device_id, updated_at) \
              VALUES (TRUE, $1, NOW()) \
              ON CONFLICT (singleton) DO UPDATE SET device_id = EXCLUDED.device_id, updated_at = NOW()",
@@ -193,30 +221,142 @@ impl AppState {
             .context("performing initial Matrix sync")?;
 
         let sync_client = client.clone();
-        let sync_token = client
-            .sync_token()
-            .await
-            .ok_or_else(|| anyhow!("initial Matrix sync did not return a token"))?;
-        let sync_settings = SyncSettings::default().token(sync_token);
         tokio::spawn(async move {
-            sync_client.sync(sync_settings).await;
-            warn!("Matrix sync loop stopped");
+            if let Err(error) = sync_client.sync(SyncSettings::default()).await {
+                warn!(error = ?error, "Matrix sender sync loop stopped");
+            }
         });
 
         *self.client.write().await = Some(client.clone());
-        info!("Matrix client initialized");
-        Ok(self.setup_status(Some(client)).await)
+        info!("Matrix sender client initialized");
+
+        let monitor_client = self.bootstrap_monitor().await?;
+        *self.monitor_client.write().await = Some(monitor_client.clone());
+        info!("Matrix delivery monitor initialized");
+        Ok(self.setup_status(Some(client), Some(monitor_client)).await)
     }
 
-    async fn setup_status(&self, known_client: Option<Client>) -> SetupStatus {
+    fn monitor_store_encryption_key(&self) -> String {
+        // The monitor must not share the sender's SDK store. Deriving a
+        // separate at-rest key avoids another operator-managed secret while
+        // keeping its private crypto state cryptographically distinct.
+        let mut hasher = Sha256::new();
+        hasher.update(self.config.store_encryption_key.as_bytes());
+        hasher.update(b"\0matrix-delivery-monitor-store-v1");
+        hasher.update(self.config.monitor_user_id.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    async fn bootstrap_monitor(&self) -> Result<Client> {
+        let monitor_store_key = self.monitor_store_encryption_key();
+        let monitor_store_dir = monitor_store_directory(
+            &self.config.store_dir,
+            self.config.monitor_user_id.as_str(),
+        );
+        fs::create_dir_all(&monitor_store_dir)
+            .context("creating Matrix delivery-monitor SQLite store directory")?;
+        let client = Client::builder()
+            .homeserver_url(self.config.homeserver_url.as_str())
+            .sqlite_store(&monitor_store_dir, Some(monitor_store_key.as_str()))
+            .build()
+            .await
+            .context("creating Matrix delivery-monitor client")?;
+
+        if !client.matrix_auth().logged_in() {
+            client
+                .matrix_auth()
+                .login_username(
+                    self.config.monitor_user_id.as_str(),
+                    self.config.monitor_password.as_str(),
+                )
+                .initial_device_display_name("n8n Matrix Delivery Monitor")
+                .send()
+                .await
+                .context("logging in Matrix delivery monitor")?;
+        }
+        let device_id = client
+            .device_id()
+            .ok_or_else(|| anyhow!("Matrix delivery-monitor login did not return a device ID"))?
+            .to_string();
+        query(
+            "UPDATE matrix_service.client_state \
+             SET monitor_user_id = $1, monitor_device_id = $2, updated_at = NOW() \
+             WHERE singleton = TRUE",
+        )
+        .bind(&self.config.monitor_user_id)
+        .bind(&device_id)
+        .execute(&self.pool)
+        .await
+        .context("persisting Matrix delivery-monitor device ID")?;
+
+        let receipt_pool = self.pool.clone();
+        let sender_user_id = self.config.user_id.clone();
+        client.add_event_handler(
+                move |event: OriginalSyncRoomMessageEvent,
+                      room: Room,
+                      encryption_info: Option<EncryptionInfo>| {
+                    let receipt_pool = receipt_pool.clone();
+                    let sender_user_id = sender_user_id.clone();
+                    async move {
+                        if encryption_info.is_none() || event.sender.as_str() != sender_user_id {
+                            return;
+                        }
+                        if let Err(error) = query(
+                            "INSERT INTO matrix_service.monitor_receipts \
+                             (event_id, room_id, sender) VALUES ($1, $2, $3) \
+                             ON CONFLICT (event_id) DO NOTHING",
+                        )
+                        .bind(event.event_id.as_str())
+                        .bind(room.room_id().as_str())
+                        .bind(event.sender.as_str())
+                        .execute(&receipt_pool)
+                        .await
+                        {
+                            error!(error = ?error, event_id = %event.event_id, "Unable to persist Matrix delivery-monitor receipt");
+                        }
+                    }
+                },
+            );
+        client
+            .sync_once(SyncSettings::default())
+            .await
+            .context("performing initial Matrix delivery-monitor sync")?;
+        let default_room_id: OwnedRoomId = self
+            .config
+            .default_room_id
+            .parse()
+            .context("parsing default Matrix room ID for delivery monitor")?;
+        if joined_room(&client, &default_room_id).is_none() {
+            return Err(anyhow!(
+                "Matrix delivery-monitor account has not joined the default room; invite {} and accept the invitation",
+                self.config.monitor_user_id
+            ));
+        }
+
+        let sync_client = client.clone();
+        tokio::spawn(async move {
+            if let Err(error) = sync_client.sync(SyncSettings::default()).await {
+                warn!(error = ?error, "Matrix delivery-monitor sync loop stopped");
+            }
+        });
+        Ok(client)
+    }
+
+    async fn setup_status(
+        &self,
+        known_client: Option<Client>,
+        known_monitor_client: Option<Client>,
+    ) -> SetupStatus {
         let client = match known_client {
             Some(client) => Some(client),
             None => self.client.read().await.clone(),
         };
 
         let initialized = client.is_some();
+        let monitor_initialized =
+            known_monitor_client.is_some() || self.monitor_client.read().await.is_some();
         let device_id: Option<String> = if initialized {
-            sqlx::query_scalar(
+            query_scalar(
                 "SELECT device_id FROM matrix_service.client_state WHERE singleton = TRUE",
             )
             .fetch_optional(&self.pool)
@@ -230,6 +370,18 @@ impl AppState {
         SetupStatus {
             initialized,
             device_id,
+            monitor_initialized,
+            monitor_device_id: if monitor_initialized {
+                query_scalar(
+                    "SELECT monitor_device_id FROM matrix_service.client_state WHERE singleton = TRUE",
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten()
+            } else {
+                None
+            },
             default_room_id: self.config.default_room_id.clone(),
         }
     }
@@ -240,6 +392,12 @@ impl AppState {
             .await
             .clone()
             .ok_or_else(|| ApiError::service_unavailable("Matrix setup has not completed"))
+    }
+
+    async fn ready_monitor_client(&self) -> Result<Client, ApiError> {
+        self.monitor_client.read().await.clone().ok_or_else(|| {
+            ApiError::service_unavailable("Matrix delivery monitor has not completed setup")
+        })
     }
 }
 
@@ -254,12 +412,20 @@ struct HealthResponse {
 struct SetupStatus {
     initialized: bool,
     device_id: Option<String>,
+    monitor_initialized: bool,
+    monitor_device_id: Option<String>,
     default_room_id: String,
 }
 
 #[derive(Deserialize)]
 #[serde(crate = "rocket::serde")]
 struct EnableEncryptionRequest {
+    confirm: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(crate = "rocket::serde")]
+struct RotateEncryptionSessionRequest {
     confirm: bool,
 }
 
@@ -307,6 +473,12 @@ struct SendMessageResponse {
 
 #[derive(Serialize)]
 #[serde(crate = "rocket::serde")]
+struct VerificationRequestResponse {
+    requested_device_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(crate = "rocket::serde")]
 struct ErrorBody {
     error: ErrorDetails,
 }
@@ -327,31 +499,63 @@ struct ApiError {
 
 impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
-        Self { status: Status::BadRequest, code: "INVALID_REQUEST", message: message.into() }
+        Self {
+            status: Status::BadRequest,
+            code: "INVALID_REQUEST",
+            message: message.into(),
+        }
     }
 
     fn unauthorized() -> Self {
-        Self { status: Status::Unauthorized, code: "UNAUTHORIZED", message: "Missing or invalid API key".into() }
+        Self {
+            status: Status::Unauthorized,
+            code: "UNAUTHORIZED",
+            message: "Missing or invalid API key".into(),
+        }
     }
 
     fn conflict(code: &'static str, message: impl Into<String>) -> Self {
-        Self { status: Status::Conflict, code, message: message.into() }
+        Self {
+            status: Status::Conflict,
+            code,
+            message: message.into(),
+        }
     }
 
     fn service_unavailable(message: impl Into<String>) -> Self {
-        Self { status: Status::ServiceUnavailable, code: "SETUP_REQUIRED", message: message.into() }
+        Self {
+            status: Status::ServiceUnavailable,
+            code: "SETUP_REQUIRED",
+            message: message.into(),
+        }
     }
 
     fn internal(error: anyhow::Error) -> Self {
         error!(error = ?error, "Matrix Service request failed");
-        Self { status: Status::InternalServerError, code: "MATRIX_DELIVERY_FAILED", message: "Matrix delivery failed".into() }
+        Self {
+            status: Status::InternalServerError,
+            code: "MATRIX_DELIVERY_FAILED",
+            message: "Matrix delivery failed".into(),
+        }
+    }
+
+    fn monitor_timeout(error: anyhow::Error) -> Self {
+        error!(error = ?error, "Matrix delivery-monitor did not decrypt message");
+        Self {
+            status: Status::BadGateway,
+            code: "MATRIX_MONITOR_DECRYPT_TIMEOUT",
+            message: "Matrix delivery monitor did not decrypt the encrypted message in time".into(),
+        }
     }
 }
 
 impl<'r> Responder<'r, 'static> for ApiError {
     fn respond_to(self, _: &'r Request<'_>) -> response::Result<'static> {
         let body = serde_json::to_string(&ErrorBody {
-            error: ErrorDetails { code: self.code, message: self.message },
+            error: ErrorDetails {
+                code: self.code,
+                message: self.message,
+            },
         })
         .expect("error body is serializable");
 
@@ -371,7 +575,10 @@ impl<'r> FromRequest<'r> for ApiKey {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let Some(state) = request.rocket().state::<AppState>() else {
-            return Outcome::Error((Status::InternalServerError, ApiError::service_unavailable("Service state is unavailable")));
+            return Outcome::Error((
+                Status::InternalServerError,
+                ApiError::service_unavailable("Service state is unavailable"),
+            ));
         };
 
         let provided = request
@@ -381,7 +588,10 @@ impl<'r> FromRequest<'r> for ApiKey {
 
         match provided {
             Some(provided)
-                if provided.as_bytes().ct_eq(state.config.service_api_key.as_bytes()).into() =>
+                if provided
+                    .as_bytes()
+                    .ct_eq(state.config.service_api_key.as_bytes())
+                    .into() =>
             {
                 Outcome::Success(ApiKey)
             }
@@ -397,15 +607,70 @@ fn healthz() -> Json<HealthResponse> {
 
 #[get("/v1/setup/status")]
 async fn setup_status(_key: ApiKey, state: &State<AppState>) -> Json<SetupStatus> {
-    Json(state.setup_status(None).await)
+    Json(state.setup_status(None, None).await)
 }
 
 #[post("/v1/setup/bootstrap")]
 async fn bootstrap(_key: ApiKey, state: &State<AppState>) -> Result<Json<SetupStatus>, ApiError> {
-    state.bootstrap().await.map(Json).map_err(ApiError::internal)
+    state
+        .bootstrap()
+        .await
+        .map(Json)
+        .map_err(ApiError::internal)
 }
 
-#[post("/v1/setup/rooms/<room_id>/enable-encryption", format = "json", data = "<request>")]
+#[post("/v1/setup/monitor/request-verification")]
+async fn request_monitor_verification(
+    _key: ApiKey,
+    state: &State<AppState>,
+) -> Result<Json<VerificationRequestResponse>, ApiError> {
+    let client = state.ready_monitor_client().await?;
+    let monitor_user_id: OwnedUserId = state.config.monitor_user_id.parse().map_err(|_| {
+        ApiError::bad_request("MATRIX_MONITOR_USER_ID is not a canonical Matrix user ID")
+    })?;
+    let own_device_id: Option<String> = query_scalar(
+        "SELECT monitor_device_id FROM matrix_service.client_state WHERE singleton = TRUE",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| ApiError::internal(anyhow!(error)))?;
+    let devices = client
+        .encryption()
+        .get_user_devices(&monitor_user_id)
+        .await
+        .map_err(|error| ApiError::internal(anyhow!(error)))?;
+    let mut requested_device_ids = Vec::new();
+    for device in devices.devices() {
+        let device_id = device.device_id().to_string();
+        if own_device_id.as_deref() == Some(device_id.as_str()) {
+            continue;
+        }
+        device
+            .request_verification()
+            .await
+            .map_err(|error| ApiError::internal(anyhow!(error)))?;
+        requested_device_ids.push(device_id);
+    }
+    if requested_device_ids.is_empty() {
+        return Err(ApiError::bad_request(
+            "No other Matrix devices are available for verification",
+        ));
+    }
+    info!(
+        monitor_user_id = %state.config.monitor_user_id,
+        device_count = requested_device_ids.len(),
+        "Matrix device-verification requests sent"
+    );
+    Ok(Json(VerificationRequestResponse {
+        requested_device_ids,
+    }))
+}
+
+#[post(
+    "/v1/setup/rooms/<room_id>/enable-encryption",
+    format = "json",
+    data = "<request>"
+)]
 async fn enable_encryption(
     _key: ApiKey,
     room_id: &str,
@@ -413,28 +678,81 @@ async fn enable_encryption(
     state: &State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !request.confirm {
-        return Err(ApiError::bad_request("Set confirm to true to enable room encryption"));
+        return Err(ApiError::bad_request(
+            "Set confirm to true to enable room encryption",
+        ));
     }
 
     let room_id: OwnedRoomId = room_id
         .parse()
         .map_err(|_| ApiError::bad_request("room_id must be a canonical Matrix room ID"))?;
     let client = state.ready_client().await?;
-    let room = client
-        .get_joined_room(&room_id)
+    let room = joined_room(&client, &room_id)
         .ok_or_else(|| ApiError::bad_request("The Matrix account has not joined this room"))?;
 
-    room.enable_encryption()
+    room.enable_encryption().await.map_err(|error| {
+        error!(room_id = %room_id, error = ?error, "Unable to enable Matrix room encryption");
+        ApiError {
+            status: Status::InternalServerError,
+            code: "MATRIX_ENCRYPTION_ENABLE_FAILED",
+            message: "Matrix could not enable room encryption; check Matrix Service logs".into(),
+        }
+    })?;
+    Ok(Json(
+        serde_json::json!({ "room_id": room_id, "encrypted": true }),
+    ))
+}
+
+#[post(
+    "/v1/setup/rooms/<room_id>/rotate-encryption-session",
+    format = "json",
+    data = "<request>"
+)]
+async fn rotate_encryption_session(
+    _key: ApiKey,
+    room_id: &str,
+    request: Json<RotateEncryptionSessionRequest>,
+    state: &State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !request.confirm {
+        return Err(ApiError::bad_request(
+            "Set confirm to true to rotate the room encryption session",
+        ));
+    }
+
+    // The maintained SDK discards the active session in place. The next send
+    // creates and shares a replacement key without restarting the service.
+    let _send_guard = state.send_lock.lock().await;
+    let room_id: OwnedRoomId = room_id
+        .parse()
+        .map_err(|_| ApiError::bad_request("room_id must be a canonical Matrix room ID"))?;
+    let client = state.ready_client().await?;
+    let room = joined_room(&client, &room_id)
+        .ok_or_else(|| ApiError::bad_request("The Matrix account has not joined this room"))?;
+    if !room
+        .latest_encryption_state()
         .await
-        .map_err(|error| {
-            error!(room_id = %room_id, error = ?error, "Unable to enable Matrix room encryption");
-            ApiError {
-                status: Status::InternalServerError,
-                code: "MATRIX_ENCRYPTION_ENABLE_FAILED",
-                message: "Matrix could not enable room encryption; check Matrix Service logs".into(),
-            }
-        })?;
-    Ok(Json(serde_json::json!({ "room_id": room_id, "encrypted": true })))
+        .map_err(|error| ApiError::internal(anyhow!(error)))?
+        .is_encrypted()
+    {
+        return Err(ApiError {
+            status: Status::Conflict,
+            code: "ROOM_ENCRYPTION_REQUIRED",
+            message: "The room is not configured for end-to-end encryption".into(),
+        });
+    }
+    room
+        .discard_room_key()
+        .await
+        .map_err(|error| ApiError::internal(anyhow!(error)))?;
+
+    info!(room_id = %room_id, "Matrix outbound encryption session invalidated");
+    Ok(Json(serde_json::json!({
+        "room_id": room_id,
+        "encrypted": true,
+        "invalidated": true,
+        "restart_required": false,
+    })))
 }
 
 #[post("/v1/messages", format = "json", data = "<request>")]
@@ -451,20 +769,33 @@ async fn send_message(
     let _send_guard = state.send_lock.lock().await;
     let format = request.format.unwrap_or(MessageFormat::Markdown);
     let encrypted = request.encrypted.unwrap_or(true);
-    let room_id = request.room_id.unwrap_or_else(|| state.config.default_room_id.clone());
+    let room_id = request
+        .room_id
+        .unwrap_or_else(|| state.config.default_room_id.clone());
     let room_id: OwnedRoomId = room_id
         .parse()
         .map_err(|_| ApiError::bad_request("room_id must be a canonical Matrix room ID"))?;
     let client = state.ready_client().await?;
-    let room = client
-        .get_joined_room(&room_id)
+    let room = joined_room(&client, &room_id)
         .ok_or_else(|| ApiError::bad_request("The Matrix account has not joined this room"))?;
 
-    if encrypted && !room.is_encrypted() {
+    let room_is_encrypted = room
+        .latest_encryption_state()
+        .await
+        .map_err(|error| ApiError::internal(anyhow!(error)))?
+        .is_encrypted();
+    if encrypted && !room_is_encrypted {
         return Err(ApiError {
             status: Status::Conflict,
             code: "ROOM_ENCRYPTION_REQUIRED",
             message: "The room is not configured for end-to-end encryption".into(),
+        });
+    }
+    if !encrypted && room_is_encrypted {
+        return Err(ApiError {
+            status: Status::Conflict,
+            code: "ROOM_ENCRYPTION_REQUIRED",
+            message: "Plaintext delivery is not permitted in an encrypted room".into(),
         });
     }
 
@@ -482,7 +813,10 @@ async fn send_message(
         .map(|request_id| idempotency_key(request_id, room_id.as_str()));
 
     if let Some(request_key) = request_key.as_deref() {
-        if let Some(existing) = load_idempotency_record(&state.pool, request_key).await.map_err(ApiError::internal)? {
+        if let Some(existing) = load_idempotency_record(&state.pool, request_key)
+            .await
+            .map_err(ApiError::internal)?
+        {
             if existing.request_hash != request_hash {
                 return Err(ApiError::conflict(
                     "IDEMPOTENCY_CONFLICT",
@@ -502,9 +836,15 @@ async fn send_message(
             }
         }
 
-        save_in_progress_record(&state.pool, request_key, &request_hash, room_id.as_str(), encrypted)
-            .await
-            .map_err(ApiError::internal)?;
+        save_in_progress_record(
+            &state.pool,
+            request_key,
+            &request_hash,
+            room_id.as_str(),
+            encrypted,
+        )
+        .await
+        .map_err(ApiError::internal)?;
     }
 
     let image_event_id = if let Some(image_url) = request.image_url.as_deref() {
@@ -523,12 +863,13 @@ async fn send_message(
                 ));
             }
         };
-        let image_transaction_id = stable_transaction_id(request_key.as_deref(), &request_hash, "image")
-            .map_err(ApiError::internal)?;
+        let image_transaction_id =
+            stable_transaction_id(request_key.as_deref(), &request_hash, "image")
+                .map_err(ApiError::internal)?;
         let response = if encrypted {
             send_encrypted(&room, image, &image_transaction_id).await
         } else {
-            send_plaintext(&client, &room_id, image, &image_transaction_id).await
+            send_plaintext(&room, image, &image_transaction_id).await
         };
         let response = match response {
             Ok(response) => response,
@@ -546,9 +887,9 @@ async fn send_message(
         .map_err(ApiError::internal)?;
     let content = format_content(&request.message, format);
     let result = if encrypted {
-        send_encrypted(&room, content, &transaction_id).await
+        send_encrypted(&room, content.clone(), &transaction_id).await
     } else {
-        send_plaintext(&client, &room_id, content, &transaction_id).await
+        send_plaintext(&room, content.clone(), &transaction_id).await
     };
 
     let response = match result {
@@ -559,7 +900,47 @@ async fn send_message(
         }
     };
 
-    let event_id = response.event_id.to_string();
+    let mut event_id = response.event_id.to_string();
+    if encrypted {
+        if let Err(error) = wait_for_monitor_receipt(&state.pool, &event_id).await {
+            record_monitor_delivery_failure(&state.pool, &event_id, room_id.as_str(), 1).await
+                .map_err(ApiError::internal)?;
+            warn!(event_id = %event_id, error = ?error, "Matrix monitor did not decrypt event; rotating session and retrying once");
+            if let Err(error) = room.discard_room_key().await {
+                delete_in_progress_record(&state.pool, request_key.as_deref()).await;
+                return Err(ApiError::internal(anyhow!(error)));
+            }
+
+            let recovery_transaction_id =
+                stable_transaction_id(request_key.as_deref(), &request_hash, "message-recovery")
+                    .map_err(ApiError::internal)?;
+            let recovery_response = match send_encrypted(&room, content, &recovery_transaction_id).await {
+                Ok(response) => response,
+                Err(error) => {
+                    delete_in_progress_record(&state.pool, request_key.as_deref()).await;
+                    return Err(ApiError::internal(error));
+                }
+            };
+            let recovery_event_id = recovery_response.event_id.to_string();
+            if let Err(error) = wait_for_monitor_receipt(&state.pool, &recovery_event_id).await {
+                record_monitor_delivery_failure(
+                    &state.pool,
+                    &recovery_event_id,
+                    room_id.as_str(),
+                    2,
+                )
+                .await
+                .map_err(ApiError::internal)?;
+                delete_in_progress_record(&state.pool, request_key.as_deref()).await;
+                return Err(ApiError::monitor_timeout(error));
+            }
+            mark_monitor_delivery_recovered(&state.pool, &event_id)
+                .await
+                .map_err(ApiError::internal)?;
+            info!(failed_event_id = %event_id, recovery_event_id = %recovery_event_id, "Matrix encrypted delivery recovered with a new session");
+            event_id = recovery_event_id;
+        }
+    }
     if let Some(request_key) = request_key.as_deref() {
         complete_idempotency_record(&state.pool, request_key, &event_id)
             .await
@@ -594,6 +975,7 @@ button.primary{background:#000;color:#fff;font-weight:700}button.primary:hover{b
 <button type="button" onclick="bootstrap()">Initialize Matrix device</button>
 <label>Room ID<input id="room-id" placeholder="!room:server"></label>
 <button id="enable-button" class="primary" type="button" onclick="enableEncryption()">Confirm and enable encryption</button>
+<button id="rotate-button" type="button" onclick="rotateEncryptionSession()">Confirm and rotate encryption session</button>
 <div id="result" role="status" aria-live="polite" hidden></div>
 <script>
 const apiRoot=window.location.pathname.startsWith('/matrix/')?'/matrix/v1':'/v1';
@@ -617,36 +999,88 @@ async function callApi(path, method, body) {
 }
 async function bootstrap(){const payload=await callApi(apiRoot+'/setup/bootstrap','POST');if(payload)showResult('success','Matrix device is ready. Enter the room ID below and confirm encryption if the room is not already encrypted.');}
 async function enableEncryption(){const room=document.getElementById('room-id').value.trim();if(!room){showResult('failure','Enter the Matrix room ID to enable encryption.');return;}const button=document.getElementById('enable-button');button.disabled=true;try{const payload=await callApi(apiRoot+'/setup/rooms/'+encodeURIComponent(room)+'/enable-encryption','POST',{confirm:true});if(payload&&payload.encrypted)showResult('success',`Encryption is enabled for ${payload.room_id}. Matrix Sender can now deliver encrypted notifications to this room. You can close this window.`);}finally{button.disabled=false;}}
+async function rotateEncryptionSession(){const room=document.getElementById('room-id').value.trim();if(!room){showResult('failure','Enter the Matrix room ID to rotate its encryption session.');return;}const button=document.getElementById('rotate-button');button.disabled=true;try{const payload=await callApi(apiRoot+'/setup/rooms/'+encodeURIComponent(room)+'/rotate-encryption-session','POST',{confirm:true});if(payload&&payload.restart_required)showResult('success',`The outbound encryption session for ${payload.room_id} was invalidated. Restart the Matrix service before sending another encrypted notification.`);}finally{button.disabled=false;}}
 </script></body></html>"#,
     )
 }
 
 async fn send_encrypted(
-    room: &Joined,
+    room: &Room,
     content: RoomMessageEventContent,
     transaction_id: &OwnedTransactionId,
 ) -> Result<matrix_sdk::ruma::api::client::message::send_message_event::v3::Response> {
-    room.send(content, Some(transaction_id))
+    room.send(content)
+        .with_transaction_id(transaction_id.to_owned())
         .await
+        .map(|response| response.response)
         .map_err(|error| anyhow!("sending encrypted Matrix event: {error:?}"))
 }
 
+async fn wait_for_monitor_receipt(pool: &PgPool, event_id: &str) -> Result<()> {
+    let wait_for_receipt = async {
+        loop {
+            let received: bool = query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM matrix_service.monitor_receipts WHERE event_id = $1)",
+            )
+            .bind(event_id)
+            .fetch_one(pool)
+            .await
+            .context("checking Matrix delivery-monitor receipt")?;
+            if received {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(45), wait_for_receipt)
+        .await
+        .map_err(|_| {
+            anyhow!("no decryption receipt for encrypted Matrix event within 45 seconds")
+        })?
+}
+
+async fn record_monitor_delivery_failure(
+    pool: &PgPool,
+    event_id: &str,
+    room_id: &str,
+    attempt: i16,
+) -> Result<()> {
+    query(
+        "INSERT INTO matrix_service.monitor_delivery_failures \
+         (event_id, room_id, attempt, failure_kind) \
+         VALUES ($1, $2, $3, 'monitor_decrypt_timeout') \
+         ON CONFLICT (event_id) DO NOTHING",
+    )
+    .bind(event_id)
+    .bind(room_id)
+    .bind(attempt)
+    .execute(pool)
+    .await
+    .context("recording Matrix monitor delivery failure")?;
+    Ok(())
+}
+
+async fn mark_monitor_delivery_recovered(pool: &PgPool, failed_event_id: &str) -> Result<()> {
+    query(
+        "UPDATE matrix_service.monitor_delivery_failures \
+         SET recovered_at = NOW() WHERE event_id = $1",
+    )
+    .bind(failed_event_id)
+    .execute(pool)
+    .await
+    .context("recording Matrix monitor delivery recovery")?;
+    Ok(())
+}
+
 async fn send_plaintext(
-    client: &Client,
-    room_id: &OwnedRoomId,
+    room: &Room,
     content: RoomMessageEventContent,
     transaction_id: &OwnedTransactionId,
 ) -> Result<matrix_sdk::ruma::api::client::message::send_message_event::v3::Response> {
-    let raw_content = Raw::new(&content).context("serializing plaintext Matrix event")?.cast();
-    let request = send_message_event::v3::Request::new_raw(
-        room_id,
-        transaction_id,
-        "m.room.message".into(),
-        raw_content,
-    );
-    client
-        .send(request, None)
+    room.send(content)
+        .with_transaction_id(transaction_id.to_owned())
         .await
+        .map(|response| response.response)
         .map_err(|error| anyhow!("sending plaintext Matrix event: {error:?}"))
 }
 
@@ -655,10 +1089,7 @@ fn format_content(message: &str, format: MessageFormat) -> RoomMessageEventConte
         MessageFormat::Text => RoomMessageEventContent::text_plain(message),
         MessageFormat::Markdown => {
             let mut html_body = String::new();
-            html::push_html(
-                &mut html_body,
-                Parser::new_ext(message, Options::all()),
-            );
+            html::push_html(&mut html_body, Parser::new_ext(message, Options::all()));
             RoomMessageEventContent::text_html(message, ammonia::clean(&html_body))
         }
         MessageFormat::Html => {
@@ -682,7 +1113,9 @@ async fn fetch_and_resize_public_image(
 ) -> Result<RoomMessageEventContent> {
     let parsed = reqwest::Url::parse(image_url).context("parsing image URL")?;
     if parsed.scheme() != "https" || !is_allowed_image_host(parsed.host_str()) {
-        return Err(anyhow!("image URL must use HTTPS and an approved public CDN"));
+        return Err(anyhow!(
+            "image URL must use HTTPS and an approved public CDN"
+        ));
     }
 
     let client = reqwest::Client::builder()
@@ -734,9 +1167,9 @@ async fn fetch_and_resize_public_image(
     let size = UInt::try_from(encoded.len()).context("recording resized image size")?;
     let width = UInt::try_from(width).context("recording resized image width")?;
     let height = UInt::try_from(height).context("recording resized image height")?;
-    let mut upload = Cursor::new(encoded);
     let mxc_uri = matrix_client
-        .upload(&mime::IMAGE_JPEG, &mut upload)
+        .media()
+        .upload(&mime::IMAGE_JPEG, encoded, None)
         .await
         .context("uploading resized product image to Matrix")?
         .content_uri;
@@ -745,9 +1178,9 @@ async fn fetch_and_resize_public_image(
     info.height = Some(height);
     info.mimetype = Some("image/jpeg".into());
     info.size = Some(size);
-    Ok(RoomMessageEventContent::new(MessageType::Image(
-        ImageMessageEventContent::plain(alt_text.to_owned(), mxc_uri, Some(Box::new(info))),
-    )))
+    let mut image = ImageMessageEventContent::plain(alt_text.to_owned(), mxc_uri);
+    image.info = Some(Box::new(info));
+    Ok(RoomMessageEventContent::new(MessageType::Image(image)))
 }
 
 fn is_allowed_image_host(host: Option<&str>) -> bool {
@@ -760,7 +1193,6 @@ fn is_allowed_image_host(host: Option<&str>) -> bool {
     )
 }
 
-#[derive(sqlx::FromRow)]
 struct IdempotencyRecord {
     request_hash: String,
     room_id: String,
@@ -768,15 +1200,24 @@ struct IdempotencyRecord {
     event_id: Option<String>,
 }
 
-async fn load_idempotency_record(pool: &PgPool, request_key: &str) -> Result<Option<IdempotencyRecord>> {
-    sqlx::query_as(
+async fn load_idempotency_record(
+    pool: &PgPool,
+    request_key: &str,
+) -> Result<Option<IdempotencyRecord>> {
+    let record: Option<(String, String, bool, Option<String>)> = query_as(
         "SELECT request_hash, room_id, encrypted, event_id \
          FROM matrix_service.idempotency_records WHERE request_key = $1",
     )
     .bind(request_key)
     .fetch_optional(pool)
     .await
-    .context("loading idempotency record")
+    .context("loading idempotency record")?;
+    Ok(record.map(|(request_hash, room_id, encrypted, event_id)| IdempotencyRecord {
+        request_hash,
+        room_id,
+        encrypted,
+        event_id,
+    }))
 }
 
 async fn save_in_progress_record(
@@ -786,7 +1227,7 @@ async fn save_in_progress_record(
     room_id: &str,
     encrypted: bool,
 ) -> Result<()> {
-    sqlx::query(
+    query(
         "INSERT INTO matrix_service.idempotency_records \
          (request_key, request_hash, room_id, encrypted, status) \
          VALUES ($1, $2, $3, $4, 'in_progress') \
@@ -802,8 +1243,12 @@ async fn save_in_progress_record(
     Ok(())
 }
 
-async fn complete_idempotency_record(pool: &PgPool, request_key: &str, event_id: &str) -> Result<()> {
-    sqlx::query(
+async fn complete_idempotency_record(
+    pool: &PgPool,
+    request_key: &str,
+    event_id: &str,
+) -> Result<()> {
+    query(
         "UPDATE matrix_service.idempotency_records \
          SET event_id = $2, status = 'complete', completed_at = NOW() \
          WHERE request_key = $1",
@@ -820,7 +1265,7 @@ async fn delete_in_progress_record(pool: &PgPool, request_key: Option<&str>) {
     let Some(request_key) = request_key else {
         return;
     };
-    let _ = sqlx::query(
+    let _ = query(
         "DELETE FROM matrix_service.idempotency_records WHERE request_key = $1 AND status = 'in_progress'",
     )
     .bind(request_key)
@@ -859,7 +1304,11 @@ fn idempotency_key(request_id: &str, room_id: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn stable_transaction_id(request_key: Option<&str>, request_hash: &str, kind: &str) -> Result<OwnedTransactionId> {
+fn stable_transaction_id(
+    request_key: Option<&str>,
+    request_hash: &str,
+    kind: &str,
+) -> Result<OwnedTransactionId> {
     let value = request_key
         .map(|key| format!("n8n-{kind}-{}", &key[..28]))
         .unwrap_or_else(|| format!("n8n-{kind}-{}", Uuid::new_v4().simple()));
@@ -874,7 +1323,10 @@ struct CleanupFairing;
 #[rocket::async_trait]
 impl Fairing for CleanupFairing {
     fn info(&self) -> Info {
-        Info { name: "idempotency cleanup", kind: Kind::Ignite }
+        Info {
+            name: "idempotency cleanup",
+            kind: Kind::Ignite,
+        }
     }
 
     async fn on_ignite(&self, rocket: rocket::Rocket<rocket::Build>) -> rocket::fairing::Result {
@@ -885,7 +1337,7 @@ impl Fairing for CleanupFairing {
         let retention_days = state.config.idempotency_retention_days;
         tokio::spawn(async move {
             loop {
-                if let Err(error) = sqlx::query(
+                if let Err(error) = query(
                     "DELETE FROM matrix_service.idempotency_records \
                      WHERE status = 'complete' \
                      AND completed_at < NOW() - ($1 * INTERVAL '1 day')",
@@ -916,23 +1368,15 @@ async fn main() -> Result<()> {
         .connect(&config.database_url)
         .await
         .context("connecting to Postgres")?;
-    MIGRATOR.run(&pool).await.context("running Matrix Service migrations")?;
-
-    // matrix-sdk-sql uses SQLx's standard migration table. Keep it in its own
-    // schema so its migration history cannot collide with this service's
-    // application migrations.
-    let sdk_database_url = database_url_with_search_path(&config.database_url, "matrix_sdk");
-    let sdk_pool = PgPoolOptions::new()
-        .max_connections(8)
-        .connect(&sdk_database_url)
+    run_migrations(&pool)
         .await
-        .context("connecting Matrix SDK Postgres pool")?;
+        .context("running Matrix Service migrations")?;
 
     let state = AppState {
         config,
-        sdk_pool: Arc::new(sdk_pool),
         pool,
         client: RwLock::new(None),
+        monitor_client: RwLock::new(None),
         lifecycle_lock: Mutex::new(()),
         send_lock: Mutex::new(()),
     };
@@ -956,7 +1400,9 @@ async fn main() -> Result<()> {
                 healthz,
                 setup_status,
                 bootstrap,
+                request_monitor_verification,
                 enable_encryption,
+                rotate_encryption_session,
                 send_message,
                 setup_page
             ],
@@ -974,8 +1420,22 @@ mod tests {
 
     #[test]
     fn request_hash_changes_when_encryption_mode_changes() {
-        let encrypted = request_hash("hello", "!room:example.org", MessageFormat::Markdown, true, None, None);
-        let plaintext = request_hash("hello", "!room:example.org", MessageFormat::Markdown, false, None, None);
+        let encrypted = request_hash(
+            "hello",
+            "!room:example.org",
+            MessageFormat::Markdown,
+            true,
+            None,
+            None,
+        );
+        let plaintext = request_hash(
+            "hello",
+            "!room:example.org",
+            MessageFormat::Markdown,
+            false,
+            None,
+            None,
+        );
         assert_ne!(encrypted, plaintext);
     }
 
@@ -1007,7 +1467,9 @@ mod tests {
         assert!(is_allowed_image_host(Some("res.cloudinary.com")));
         assert!(is_allowed_image_host(Some("i.gr-assets.com")));
         assert!(!is_allowed_image_host(Some("proton.me")));
-        assert!(!is_allowed_image_host(Some("res.cloudinary.com.example.com")));
+        assert!(!is_allowed_image_host(Some(
+            "res.cloudinary.com.example.com"
+        )));
     }
 
     #[test]
@@ -1025,10 +1487,15 @@ mod tests {
     }
 
     #[test]
-    fn sdk_database_url_uses_its_own_search_path() {
+    fn monitor_store_is_stable_and_identity_scoped() {
+        let root = Path::new("/matrix-store");
         assert_eq!(
-            database_url_with_search_path("postgresql://user:pass@db/app", "matrix_sdk"),
-            "postgresql://user:pass@db/app?options%5Bsearch_path%5D=matrix_sdk"
+            monitor_store_directory(root, "@one:example.org"),
+            monitor_store_directory(root, "@one:example.org")
+        );
+        assert_ne!(
+            monitor_store_directory(root, "@one:example.org"),
+            monitor_store_directory(root, "@two:example.org")
         );
     }
 }

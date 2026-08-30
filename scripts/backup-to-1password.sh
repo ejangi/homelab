@@ -1,7 +1,7 @@
 #!/bin/sh
 
-# Upload the newest PostgreSQL dump to the n8n 1Password item and rotate its
-# PostgreSQL dump attachments so that only that dump remains in the item.
+# Upload the newest PostgreSQL dump and Matrix SQLite archive to the n8n
+# 1Password item, retaining the newest attachment of each kind.
 #
 # Example crontab entry (run after the PostgreSQL backup container has had time
 # to create its daily dump):
@@ -95,4 +95,44 @@ jq -r --arg section "$OP_SECTION" --arg keep "$LATEST_NAME" '
 	op_item_edit "$old_section_field.$old_field[delete]" >/dev/null
 done
 
-echo "1Password backup rotation complete: $LATEST_NAME"
+MATRIX_LATEST=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'matrix_store_backup_*.tar.gz' -printf '%T@ %p\n' \
+	| sort -n \
+	| tail -n 1 \
+	| cut -d ' ' -f 2-)
+
+# The Matrix store is created only after the service's first successful
+# bootstrap, so do not discard an existing off-site archive merely because a
+# new deployment has not produced its first archive yet.
+if [ -z "$MATRIX_LATEST" ] || [ ! -f "$MATRIX_LATEST" ]; then
+	echo "No Matrix SQLite archive found yet; PostgreSQL backup rotation complete: $LATEST_NAME"
+	exit 0
+fi
+
+MATRIX_LATEST_NAME=$(basename -- "$MATRIX_LATEST")
+MATRIX_LATEST_FIELD=$(escape_assignment_name "$MATRIX_LATEST_NAME")
+echo "Uploading $MATRIX_LATEST_NAME to 1Password item '$OP_ITEM'..."
+op_item_edit "$OP_SECTION.$MATRIX_LATEST_FIELD[file]=$MATRIX_LATEST" >/dev/null
+
+if [ -n "${OP_VAULT:-}" ]; then
+	op item get "$OP_ITEM" --vault "$OP_VAULT" --format=json >"$ITEM_JSON"
+else
+	op item get "$OP_ITEM" --format=json >"$ITEM_JSON"
+fi
+
+jq -r --arg section "$OP_SECTION" --arg keep "$MATRIX_LATEST_NAME" '
+	.files[]?
+	| select((.name // "") | test("^matrix_store_backup_.*\\.tar\\.gz$"))
+	| select(
+		(.name != $keep)
+		or ((.section.label // .section.name // "" | ascii_downcase) != ($section | ascii_downcase))
+	)
+	| [(.section.label // .section.name // ""), .name] | @tsv
+' "$ITEM_JSON" | while IFS="$(printf '\t')" read -r old_section old_name; do
+	[ -n "$old_section" ] && [ -n "$old_name" ] || continue
+	old_field=$(escape_assignment_name "$old_name")
+	old_section_field=$(escape_assignment_name "$old_section")
+	echo "Removing old Matrix archive from $old_section: $old_name"
+	op_item_edit "$old_section_field.$old_field[delete]" >/dev/null
+done
+
+echo "1Password backup rotation complete: $LATEST_NAME and $MATRIX_LATEST_NAME"

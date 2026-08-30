@@ -52,6 +52,21 @@ services:
     networks:
       - n8n_backend
 
+  # Provides a private, JavaScript-capable renderer for the few vendor support
+  # pages that publish their download metadata only after client-side rendering.
+  # n8n calls it over the existing backend network; no browser port is exposed.
+  browserless:
+    image: ghcr.io/browserless/chromium:latest
+    container_name: n8n_browserless
+    restart: unless-stopped
+    environment:
+      - CONCURRENT=1
+      - QUEUED=2
+      - TIMEOUT=60000
+      - TOKEN=
+    networks:
+      - n8n_backend
+
   # 2.5 MATRIX SERVICE
   matrix:
     build:
@@ -62,12 +77,18 @@ services:
       - MATRIX_HOMESERVER_URL=${MATRIX_HOMESERVER_URL}
       - MATRIX_USER_ID=${MATRIX_USER_ID}
       - MATRIX_PASSWORD=${MATRIX_PASSWORD}
+      - MATRIX_MONITOR_USER_ID=${MATRIX_MONITOR_USER_ID}
+      - MATRIX_MONITOR_PASSWORD=${MATRIX_MONITOR_PASSWORD}
       - MATRIX_DEFAULT_ROOM_ID=${MATRIX_DEFAULT_ROOM_ID}
       - MATRIX_SERVICE_API_KEY=${MATRIX_SERVICE_API_KEY}
       - MATRIX_STORE_ENCRYPTION_KEY=${MATRIX_STORE_ENCRYPTION_KEY}
       - MATRIX_IDEMPOTENCY_RETENTION_DAYS=${MATRIX_IDEMPOTENCY_RETENTION_DAYS}
       - MATRIX_DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       - RUST_LOG=matrix_service=info,rocket=warn
+    volumes:
+      # Matrix's maintained SQLite stores hold the sender and monitor device
+      # keys separately. They are encrypted with MATRIX_STORE_ENCRYPTION_KEY.
+      - matrix_store:/matrix-store
     depends_on:
       postgres:
         condition: service_healthy
@@ -79,6 +100,46 @@ services:
       start_period: 20s
     networks:
       - n8n_backend
+
+  # Creates an online-consistent SQLite backup of Matrix client state every
+  # day. The source volume is read-only; SQLite's backup API includes WAL data
+  # without stopping delivery.
+  matrix_store_backup:
+    build:
+      context: .
+      dockerfile: src/matrix-backup/Dockerfile
+    container_name: n8n_matrix_store_backup
+    restart: "no"
+    environment:
+      - MATRIX_STORE_DIR=/matrix-store
+      - BACKUP_DIR=/backups
+      - RETENTION_DAYS=30
+    volumes:
+      - matrix_store:/matrix-store:ro
+      - ./backups:/backups
+      - ./scripts/backup-matrix-store.sh:/usr/local/bin/backup-matrix-store.sh:ro
+    depends_on:
+      matrix:
+        condition: service_healthy
+    command:
+      ["-c", "while true; do /usr/local/bin/backup-matrix-store.sh; sleep 86400; done"]
+
+  # Invoked only by scripts/restore-matrix-store.sh. It remains dormant under
+  # the maintenance profile and receives the Matrix volume read-write solely
+  # while the sender is stopped.
+  matrix_store_restore:
+    profiles: ["maintenance"]
+    build:
+      context: .
+      dockerfile: src/matrix-backup/Dockerfile
+    environment:
+      - MATRIX_STORE_DIR=/matrix-store
+      - BACKUP_DIR=/backups
+    volumes:
+      - matrix_store:/matrix-store
+      - ./backups:/backups:ro
+      - ./scripts/restore-matrix-store-in-container.sh:/usr/local/bin/restore-matrix-store-in-container.sh:ro
+    entrypoint: ["/usr/local/bin/restore-matrix-store-in-container.sh"]
 
   # Delivers authenticated, internal n8n requests to the operator's GNOME
   # session. Its port remains private to the n8n Docker network.
@@ -371,6 +432,7 @@ volumes:
   n8n_data:
   postgres_data:
   caddy_data: # Define the new Caddy data volume
+  matrix_store:
 
 networks:
   n8n_backend:

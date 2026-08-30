@@ -1,4 +1,7 @@
 backups/*.dump
+backups/matrix_store_backup_*.tar.gz
+backups/matrix_store_backup_*.tar.gz.sha256
+src/matrix/target/
 
 # Tailscale-issued TLS certificate and private key used by Caddy.
 caddy/tailscale-certs/
