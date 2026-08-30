@@ -1,0 +1,161 @@
+{
+  "name": "Immich release alerts",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      },
+      "id": "1ff1ed20-1210-43dd-a038-4332cad9d8e4",
+      "name": "Every day at 7 AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-900, 0]
+    },
+    {
+      "parameters": {
+        "url": "https://immich.app/blog/feed.json",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "6cb85d84-3be7-40d2-b33e-287ceaa1330a",
+      "name": "Fetch Immich release feed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [-660, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "function decodeEntities(value) {\n  const named = { amp: '&', apos: \"'\", gt: '>', lt: '<', nbsp: ' ', quot: '\"' };\n  return value.replace(/&(#x[0-9a-f]+|#\\d+|[a-z]+);/gi, (entity, reference) => {\n    const lower = reference.toLowerCase();\n    if (lower[0] !== '#') return named[lower] ?? entity;\n    const codePoint = lower.startsWith('#x') ? Number.parseInt(lower.slice(2), 16) : Number.parseInt(lower.slice(1), 10);\n    try { return String.fromCodePoint(codePoint); } catch { return entity; }\n  });\n}\n\nfunction toPlainText(value) {\n  return decodeEntities(value.replace(/<script[\\s\\S]*?<\\/script>|<style[\\s\\S]*?<\\/style>/gi, '').replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim());\n}\n\nfunction escapeMarkdown(value) {\n  return value.replace(/([\\\\`*_{}[\\]<>])/g, '\\\\$1');\n}\n\nfunction compact(value, maxLength) {\n  return value.length <= maxLength ? value : `${value.slice(0, maxLength - 1).trimEnd()}…`;\n}\n\nfunction requestIdFor(value) {\n  let hash = 5381;\n  for (const character of value) hash = ((hash << 5) + hash) ^ character.charCodeAt(0);\n  return `immich-release-${(hash >>> 0).toString(36)}`;\n}\n\nconst feed = $input.first().json;\nconst posts = Array.isArray(feed.items) ? feed.items : [];\n\nreturn posts.flatMap((post) => {\n  const title = String(post.title ?? '').trim();\n  // The feed also contains recaps and migration guides. Only release posts are alerts.\n  if (!/^release\\s+v/i.test(title)) return [];\n\n  const releaseId = String(post.id ?? post.url ?? '').trim();\n  const releaseUrl = String(post.url ?? post.external_url ?? '').trim();\n  const description = compact(toPlainText(String(post.content_text ?? post.summary ?? post.content_html ?? '')), 1000);\n  const publishedAt = String(post.date_published ?? post.date_modified ?? '').trim() || null;\n\n  if (!releaseId || !releaseUrl || !description) return [];\n\n  return [{\n    json: {\n      release_id: releaseId,\n      title,\n      release_url: releaseUrl,\n      release_notes: description,\n      published_at: publishedAt,\n      first_seen_at: new Date().toISOString(),\n      message: [\n        '📷 **New Immich release**',\n        '',\n        `**${escapeMarkdown(title)}**`,\n        '',\n        escapeMarkdown(description),\n        '',\n        `[Read the full article](${releaseUrl})`,\n      ].join('\\n'),\n      matrix_request_id: requestIdFor(releaseId),\n    },\n  }];\n});"
+      },
+      "id": "47dcaa18-a2ca-4ab1-bb6b-d8d9f2bf09a1",
+      "name": "Prepare Immich release alerts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-400, 0]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "rowNotExists",
+        "dataTableId": {
+          "__rl": true,
+          "value": "duOoNBXSc7meppuc",
+          "mode": "list",
+          "cachedResultName": "Immich Releases"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "release_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.release_id }}"
+            }
+          ]
+        }
+      },
+      "id": "d9a77a4c-167d-4f04-adc2-a620fa7b127d",
+      "name": "Only new Immich releases",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [-140, 0]
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "wv07Z6jDBKWlgksk",
+          "mode": "list",
+          "cachedResultName": "Matrix Sender"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "message": "={{ $json.message }}",
+            "format": "markdown",
+            "encrypted": true,
+            "request_id": "={{ $json.matrix_request_id }}"
+          },
+          "schema": [
+            { "id": "message", "displayName": "message", "required": true, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "room_id", "displayName": "room_id", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "format", "displayName": "format", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "encrypted", "displayName": "encrypted", "required": false, "defaultMatch": false, "display": true, "type": "boolean", "canBeUsedToMatch": true },
+            { "id": "request_id", "displayName": "request_id", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true }
+          ]
+        },
+        "mode": "each",
+        "options": { "waitForSubWorkflow": true }
+      },
+      "id": "6728112d-c013-42a2-a291-da10f43a957f",
+      "name": "Send Matrix notification",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [120, 0]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const release = $('Prepare Immich release alerts').item.json;\n\nreturn {\n  json: {\n    release_id: release.release_id,\n    title: release.title,\n    release_url: release.release_url,\n    release_notes: release.release_notes,\n    published_at: release.published_at,\n    first_seen_at: release.first_seen_at,\n    matrix_event_id: $json.event_id ?? null,\n  },\n};"
+      },
+      "id": "de5ce073-8b9f-468b-8c9d-a45b5f7f1a01",
+      "name": "Prepare seen Immich release record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [380, 0]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "value": "duOoNBXSc7meppuc",
+          "mode": "list",
+          "cachedResultName": "Immich Releases"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "schema": [
+            { "id": "ooYTCdz8tBJWvh87", "displayName": "release_id", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "viF9u7dUn8DNer8X", "displayName": "title", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "x0buHLqrXzBv66Pp", "displayName": "release_url", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "Qgdg0frmwBGPTctC", "displayName": "release_notes", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "MX0wDQs2Lfa6UtHj", "displayName": "published_at", "required": false, "defaultMatch": false, "display": true, "type": "date", "canBeUsedToMatch": true },
+            { "id": "SWPcfrHVMKxrQbaH", "displayName": "first_seen_at", "required": false, "defaultMatch": false, "display": true, "type": "date", "canBeUsedToMatch": true },
+            { "id": "3K06XN1FlAA5Nd3Q", "displayName": "matrix_event_id", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true }
+          ]
+        },
+        "options": {}
+      },
+      "id": "dd6ca0bd-ec5c-4de1-ad7b-17d92b9c6fcd",
+      "name": "Record seen Immich release",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [640, 0]
+    }
+  ],
+  "connections": {
+    "Every day at 7 AM": { "main": [[{ "node": "Fetch Immich release feed", "type": "main", "index": 0 }]] },
+    "Fetch Immich release feed": { "main": [[{ "node": "Prepare Immich release alerts", "type": "main", "index": 0 }]] },
+    "Prepare Immich release alerts": { "main": [[{ "node": "Only new Immich releases", "type": "main", "index": 0 }]] },
+    "Only new Immich releases": { "main": [[{ "node": "Send Matrix notification", "type": "main", "index": 0 }]] },
+    "Send Matrix notification": { "main": [[{ "node": "Prepare seen Immich release record", "type": "main", "index": 0 }]] },
+    "Prepare seen Immich release record": { "main": [[{ "node": "Record seen Immich release", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Australia/Brisbane",
+    "errorWorkflow": "fOszDr3Us7EmONPm"
+  }
+}
