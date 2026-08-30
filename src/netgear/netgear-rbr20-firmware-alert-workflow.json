@@ -1,0 +1,202 @@
+{
+  "name": "NETGEAR RBR20 firmware alerts",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      },
+      "id": "6f0dd5a6-fb0b-4658-bf45-f23ba4d6b60d",
+      "name": "Every day at 7 AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-1180, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://browserless:3000/content",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ { url: 'https://www.netgear.com/support/product/rbr20', waitForSelector: { selector: '.firmware-latest' }, gotoOptions: { waitUntil: 'networkidle2', timeout: 60000 } } }}",
+        "options": {
+          "timeout": 90000,
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "product_html"
+            }
+          }
+        }
+      },
+      "id": "1d22ed96-61b3-4e6f-a302-90aaed32cf3d",
+      "name": "Render NETGEAR product page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [-940, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "function decodeEntities(value) {\n  const named = { amp: '&', apos: \"'\", gt: '>', lt: '<', nbsp: ' ', quot: '\"' };\n  return value.replace(/&(#x[0-9a-f]+|#\\d+|[a-z]+);/gi, (entity, reference) => {\n    const lower = reference.toLowerCase();\n    if (lower[0] !== '#') return named[lower] ?? entity;\n    const codePoint = lower.startsWith('#x') ? Number.parseInt(lower.slice(2), 16) : Number.parseInt(lower.slice(1), 10);\n    try { return String.fromCodePoint(codePoint); } catch { return entity; }\n  });\n}\n\nconst html = String($input.first().json.product_html ?? '');\nconst latest = /<div\\b(?=[^>]*\\bclass\\s*=\\s*([\"'])[^\"']*\\bfirmware-latest\\b[^\"']*\\1)(?=[^>]*\\bdata-title\\s*=\\s*([\"'])(.*?)\\2)[^>]*>/i.exec(html);\nif (!latest) throw new Error('NETGEAR product page did not contain .firmware-latest with a data-title attribute.');\n\nconst title = decodeEntities(latest[3]).trim();\nconst section = html.slice(latest.index, latest.index + 12000);\nconst releaseNotes = /<a\\b[^>]*\\bhref\\s*=\\s*([\"'])(.*?)\\1[^>]*>\\s*Release\\s*Notes\\s*<\\/a>/i.exec(section);\nif (!title || !releaseNotes) throw new Error('NETGEAR latest firmware entry did not include both its title and Release Notes link.');\n\nconst releaseUrl = decodeEntities(releaseNotes[2]).trim();\nif (!/^https:\\/\\//i.test(releaseUrl)) throw new Error(`NETGEAR returned a non-HTTPS release-notes URL: ${releaseUrl}`);\n\nreturn [{ json: { firmware_title: title, release_url: releaseUrl } }];"
+      },
+      "id": "35c9db01-2796-40d6-9421-2662f7a9e555",
+      "name": "Find latest RBR20 firmware",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-700, 0]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.release_url }}",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "release_notes_html"
+            }
+          }
+        }
+      },
+      "id": "6d3a66f1-0ab5-4de2-a7fe-bd9f53c8e3e4",
+      "name": "Fetch firmware release notes",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [-460, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "function decodeEntities(value) {\n  const named = { amp: '&', apos: \"'\", gt: '>', lt: '<', nbsp: ' ', quot: '\"' };\n  return value.replace(/&(#x[0-9a-f]+|#\\d+|[a-z]+);/gi, (entity, reference) => {\n    const lower = reference.toLowerCase();\n    if (lower[0] !== '#') return named[lower] ?? entity;\n    const codePoint = lower.startsWith('#x') ? Number.parseInt(lower.slice(2), 16) : Number.parseInt(lower.slice(1), 10);\n    try { return String.fromCodePoint(codePoint); } catch { return entity; }\n  });\n}\n\nfunction htmlToText(value) {\n  return decodeEntities(value.replace(/<br\\s*\\/?\\s*>/gi, '\\n').replace(/<[^>]+>/g, '')).replace(/\\s+/g, ' ').trim();\n}\n\nfunction escapeMarkdown(value) {\n  return value.replace(/([\\\\`*_{}[\\]<>])/g, '\\\\$1');\n}\n\nconst source = $('Find latest RBR20 firmware').item.json;\nconst html = String($input.first().json.release_notes_html ?? '');\nconst title = htmlToText(/<h1\\b[^>]*>([\\s\\S]*?)<\\/h1>/i.exec(html)?.[1] ?? source.firmware_title);\nconst date = htmlToText(/Release\\s*Date:\\s*<\\/strong>\\s*<br\\s*\\/?\\s*>\\s*([^<]+)/i.exec(html)?.[1] ?? '');\nif (!date) throw new Error('NETGEAR release notes did not contain a Release Date.');\n\nconst version = /(?:firmware\\s+)?version\\s+v?([0-9]+(?:\\.[0-9]+)+)/i.exec(title)?.[1] ?? source.firmware_title;\nconst releaseId = `${version}|${source.release_url}`;\nreturn [{\n  json: {\n    release_id: releaseId,\n    title,\n    release_date: date,\n    release_url: source.release_url,\n    first_seen_at: new Date().toISOString(),\n    message: [\n      `📡 **NETGEAR Orbi RBR20 firmware: ${escapeMarkdown(title)}**`,\n      '',\n      `Release date: ${escapeMarkdown(date)}`,\n      '',\n      `[View the release notes](${source.release_url})`,\n    ].join('\\n'),\n    matrix_request_id: `netgear-rbr20-firmware-${encodeURIComponent(releaseId)}`,\n  },\n}];"
+      },
+      "id": "5693277b-09bc-48c8-834c-377a5b54d4c2",
+      "name": "Prepare RBR20 firmware alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-220, 0]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "rowNotExists",
+        "dataTableId": {
+          "__rl": true,
+          "value": "AJwyAETQmV6eNjsV",
+          "mode": "list",
+          "cachedResultName": "NETGEAR RBR20 Firmware Releases"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "release_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.release_id }}"
+            }
+          ]
+        }
+      },
+      "id": "eb708b02-b268-4cee-a3f2-2a4d018a88cc",
+      "name": "Only new RBR20 firmware",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [20, 0]
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "wv07Z6jDBKWlgksk",
+          "mode": "list",
+          "cachedResultName": "Matrix Sender"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "message": "={{ $json.message }}",
+            "format": "markdown",
+            "encrypted": true,
+            "request_id": "={{ $json.matrix_request_id }}"
+          },
+          "schema": [
+            { "id": "message", "displayName": "message", "required": true, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "room_id", "displayName": "room_id", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "format", "displayName": "format", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "encrypted", "displayName": "encrypted", "required": false, "defaultMatch": false, "display": true, "type": "boolean", "canBeUsedToMatch": true },
+            { "id": "request_id", "displayName": "request_id", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true }
+          ]
+        },
+        "mode": "each",
+        "options": { "waitForSubWorkflow": true }
+      },
+      "id": "d9bcb9ce-8094-4344-8e3d-a7a61c939999",
+      "name": "Send Matrix notification",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [260, 0]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const firmware = $('Prepare RBR20 firmware alert').item.json;\n\nreturn {\n  json: {\n    release_id: firmware.release_id,\n    title: firmware.title,\n    release_date: firmware.release_date,\n    release_url: firmware.release_url,\n    first_seen_at: firmware.first_seen_at,\n    matrix_event_id: $json.event_id ?? null,\n  },\n};"
+      },
+      "id": "d6e9fd00-a591-4e14-aa9e-fd2c25a76834",
+      "name": "Prepare seen RBR20 firmware record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 0]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "value": "AJwyAETQmV6eNjsV",
+          "mode": "list",
+          "cachedResultName": "NETGEAR RBR20 Firmware Releases"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "schema": [
+            { "id": "G8mG0XQyxpGvAyDm", "displayName": "release_id", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "esX3InrJW3TdFgvo", "displayName": "title", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "WqKfzOpxVnIHTEAZ", "displayName": "release_date", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "F7hbQXW8S3GBUvm3", "displayName": "release_url", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "KgKJJjzvTkgTtCwB", "displayName": "first_seen_at", "required": false, "defaultMatch": false, "display": true, "type": "date", "canBeUsedToMatch": true },
+            { "id": "qfuP3WroiVgcJoA5", "displayName": "matrix_event_id", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a2ece8af-f0b0-41c9-9543-f45a5074319e",
+      "name": "Record seen RBR20 firmware",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [740, 0]
+    }
+  ],
+  "connections": {
+    "Every day at 7 AM": { "main": [[{ "node": "Render NETGEAR product page", "type": "main", "index": 0 }]] },
+    "Render NETGEAR product page": { "main": [[{ "node": "Find latest RBR20 firmware", "type": "main", "index": 0 }]] },
+    "Find latest RBR20 firmware": { "main": [[{ "node": "Fetch firmware release notes", "type": "main", "index": 0 }]] },
+    "Fetch firmware release notes": { "main": [[{ "node": "Prepare RBR20 firmware alert", "type": "main", "index": 0 }]] },
+    "Prepare RBR20 firmware alert": { "main": [[{ "node": "Only new RBR20 firmware", "type": "main", "index": 0 }]] },
+    "Only new RBR20 firmware": { "main": [[{ "node": "Send Matrix notification", "type": "main", "index": 0 }]] },
+    "Send Matrix notification": { "main": [[{ "node": "Prepare seen RBR20 firmware record", "type": "main", "index": 0 }]] },
+    "Prepare seen RBR20 firmware record": { "main": [[{ "node": "Record seen RBR20 firmware", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Australia/Brisbane",
+    "errorWorkflow": "fOszDr3Us7EmONPm"
+  }
+}
