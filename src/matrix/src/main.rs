@@ -59,12 +59,13 @@ async fn run_migrations(pool: &PgPool) -> Result<()> {
     .await
     .context("creating Matrix Service migration ledger")?;
 
-    const MIGRATIONS: [(&str, &str); 5] = [
+    const MIGRATIONS: [(&str, &str); 6] = [
         ("0001", include_str!("../migrations/0001_matrix_service.sql")),
         ("0002", include_str!("../migrations/0002_matrix_sdk_schema.sql")),
         ("0003", include_str!("../migrations/0003_matrix_delivery_monitor.sql")),
         ("0004", include_str!("../migrations/0004_matrix_monitor_identity.sql")),
         ("0005", include_str!("../migrations/0005_matrix_delivery_failures.sql")),
+        ("0006", include_str!("../migrations/0006_matrix_idempotency_monitor_status.sql")),
     ];
 
     for (version, sql) in MIGRATIONS {
@@ -152,6 +153,18 @@ fn joined_room(client: &Client, room_id: &OwnedRoomId) -> Option<Room> {
         .filter(|room| room.state() == RoomState::Joined)
 }
 
+fn start_matrix_sync_loop(client: Client, role: &'static str) {
+    tokio::spawn(async move {
+        loop {
+            match client.sync(SyncSettings::default()).await {
+                Ok(()) => warn!(role, "Matrix sync loop stopped unexpectedly; restarting"),
+                Err(error) => warn!(role, error = ?error, "Matrix sync loop stopped; retrying"),
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+}
+
 struct AppState {
     config: Config,
     pool: PgPool,
@@ -191,12 +204,24 @@ impl AppState {
             .context("creating Matrix client")?;
 
         // The legacy Postgres crypto store is deliberately not reused. Passing
-        // its device ID to a new store would claim keys we no longer possess.
+        // a device ID from another crypto store would claim keys we no longer
+        // possess. The persisted ID belongs to this service's encrypted SDK
+        // store, so it must be reused when a saved login session expires.
         if !client.matrix_auth().logged_in() {
-            client
+            let sender_device_id: Option<String> = query_scalar(
+                "SELECT device_id FROM matrix_service.client_state WHERE singleton = TRUE",
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .context("loading persisted Matrix sender device ID")?;
+            let mut login = client
                 .matrix_auth()
                 .login_username(self.config.user_id.as_str(), self.config.password.as_str())
-                .initial_device_display_name("n8n Matrix Service")
+                .initial_device_display_name("n8n Matrix Service");
+            if let Some(device_id) = sender_device_id.as_deref() {
+                login = login.device_id(device_id);
+            }
+            login
                 .send()
                 .await
                 .context("logging into Matrix")?;
@@ -220,12 +245,7 @@ impl AppState {
             .await
             .context("performing initial Matrix sync")?;
 
-        let sync_client = client.clone();
-        tokio::spawn(async move {
-            if let Err(error) = sync_client.sync(SyncSettings::default()).await {
-                warn!(error = ?error, "Matrix sender sync loop stopped");
-            }
-        });
+        start_matrix_sync_loop(client.clone(), "sender");
 
         *self.client.write().await = Some(client.clone());
         info!("Matrix sender client initialized");
@@ -263,13 +283,25 @@ impl AppState {
             .context("creating Matrix delivery-monitor client")?;
 
         if !client.matrix_auth().logged_in() {
-            client
+            let monitor_device_id: Option<String> = query_scalar(
+                "SELECT monitor_device_id FROM matrix_service.client_state \
+                 WHERE singleton = TRUE AND monitor_user_id = $1",
+            )
+            .bind(&self.config.monitor_user_id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("loading persisted Matrix delivery-monitor device ID")?;
+            let mut login = client
                 .matrix_auth()
                 .login_username(
                     self.config.monitor_user_id.as_str(),
                     self.config.monitor_password.as_str(),
                 )
-                .initial_device_display_name("n8n Matrix Delivery Monitor")
+                .initial_device_display_name("n8n Matrix Delivery Monitor");
+            if let Some(device_id) = monitor_device_id.as_deref() {
+                login = login.device_id(device_id);
+            }
+            login
                 .send()
                 .await
                 .context("logging in Matrix delivery monitor")?;
@@ -333,12 +365,7 @@ impl AppState {
             ));
         }
 
-        let sync_client = client.clone();
-        tokio::spawn(async move {
-            if let Err(error) = sync_client.sync(SyncSettings::default()).await {
-                warn!(error = ?error, "Matrix delivery-monitor sync loop stopped");
-            }
-        });
+        start_matrix_sync_loop(client.clone(), "delivery monitor");
         Ok(client)
     }
 
@@ -467,6 +494,8 @@ struct SendMessageResponse {
     image_event_id: Option<String>,
     room_id: String,
     encrypted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    monitor_verified: Option<bool>,
     idempotent_replay: bool,
     excluded_device_count: u32,
 }
@@ -539,14 +568,6 @@ impl ApiError {
         }
     }
 
-    fn monitor_timeout(error: anyhow::Error) -> Self {
-        error!(error = ?error, "Matrix delivery-monitor did not decrypt message");
-        Self {
-            status: Status::BadGateway,
-            code: "MATRIX_MONITOR_DECRYPT_TIMEOUT",
-            message: "Matrix delivery monitor did not decrypt the encrypted message in time".into(),
-        }
-    }
 }
 
 impl<'r> Responder<'r, 'static> for ApiError {
@@ -830,6 +851,7 @@ async fn send_message(
                     image_event_id: None,
                     room_id: existing.room_id,
                     encrypted: existing.encrypted,
+                    monitor_verified: existing.monitor_verified,
                     idempotent_replay: true,
                     excluded_device_count: 0,
                 }));
@@ -900,58 +922,63 @@ async fn send_message(
         }
     };
 
-    let mut event_id = response.event_id.to_string();
-    if encrypted {
-        if let Err(error) = wait_for_monitor_receipt(&state.pool, &event_id).await {
-            record_monitor_delivery_failure(&state.pool, &event_id, room_id.as_str(), 1).await
-                .map_err(ApiError::internal)?;
-            warn!(event_id = %event_id, error = ?error, "Matrix monitor did not decrypt event; rotating session and retrying once");
-            if let Err(error) = room.discard_room_key().await {
-                delete_in_progress_record(&state.pool, request_key.as_deref()).await;
-                return Err(ApiError::internal(anyhow!(error)));
-            }
-
-            let recovery_transaction_id =
-                stable_transaction_id(request_key.as_deref(), &request_hash, "message-recovery")
-                    .map_err(ApiError::internal)?;
-            let recovery_response = match send_encrypted(&room, content, &recovery_transaction_id).await {
-                Ok(response) => response,
-                Err(error) => {
-                    delete_in_progress_record(&state.pool, request_key.as_deref()).await;
-                    return Err(ApiError::internal(error));
-                }
-            };
-            let recovery_event_id = recovery_response.event_id.to_string();
-            if let Err(error) = wait_for_monitor_receipt(&state.pool, &recovery_event_id).await {
-                record_monitor_delivery_failure(
-                    &state.pool,
-                    &recovery_event_id,
-                    room_id.as_str(),
-                    2,
-                )
-                .await
-                .map_err(ApiError::internal)?;
-                delete_in_progress_record(&state.pool, request_key.as_deref()).await;
-                return Err(ApiError::monitor_timeout(error));
-            }
-            mark_monitor_delivery_recovered(&state.pool, &event_id)
-                .await
-                .map_err(ApiError::internal)?;
-            info!(failed_event_id = %event_id, recovery_event_id = %recovery_event_id, "Matrix encrypted delivery recovered with a new session");
-            event_id = recovery_event_id;
-        }
-    }
+    let event_id = response.event_id.to_string();
     if let Some(request_key) = request_key.as_deref() {
         complete_idempotency_record(&state.pool, request_key, &event_id)
             .await
             .map_err(ApiError::internal)?;
     }
 
+    let monitor_verified = if encrypted {
+        match wait_for_monitor_receipt(&state.pool, &event_id).await {
+            Ok(()) => {
+                if let Err(error) =
+                    update_monitor_verification(&state.pool, request_key.as_deref(), true).await
+                {
+                    warn!(event_id = %event_id, error = ?error, "Unable to record successful Matrix monitor verification");
+                }
+                Some(true)
+            }
+            Err(error) => {
+                if let Err(record_error) =
+                    record_monitor_delivery_failure(&state.pool, &event_id, room_id.as_str(), 1).await
+                {
+                    warn!(event_id = %event_id, error = ?record_error, "Unable to record Matrix monitor delivery failure");
+                }
+                if let Err(record_error) =
+                    update_monitor_verification(&state.pool, request_key.as_deref(), false).await
+                {
+                    warn!(event_id = %event_id, error = ?record_error, "Unable to record failed Matrix monitor verification");
+                }
+
+                // The event has already been accepted by Matrix. Retrying its
+                // content would create a second visible notification, so only
+                // prepare a new outbound session for a future delivery.
+                if let Err(rotate_error) = room.discard_room_key().await {
+                    warn!(
+                        event_id = %event_id,
+                        error = ?rotate_error,
+                        "Matrix monitor did not decrypt event and the outbound session could not be rotated"
+                    );
+                }
+                warn!(
+                    event_id = %event_id,
+                    error = ?error,
+                    "Matrix monitor did not decrypt event; preserving the accepted event without retrying it"
+                );
+                Some(false)
+            }
+        }
+    } else {
+        None
+    };
+
     Ok(Json(SendMessageResponse {
         event_id,
         image_event_id,
         room_id: room_id.to_string(),
         encrypted,
+        monitor_verified,
         idempotent_replay: false,
         excluded_device_count: 0,
     }))
@@ -1057,18 +1084,6 @@ async fn record_monitor_delivery_failure(
     .execute(pool)
     .await
     .context("recording Matrix monitor delivery failure")?;
-    Ok(())
-}
-
-async fn mark_monitor_delivery_recovered(pool: &PgPool, failed_event_id: &str) -> Result<()> {
-    query(
-        "UPDATE matrix_service.monitor_delivery_failures \
-         SET recovered_at = NOW() WHERE event_id = $1",
-    )
-    .bind(failed_event_id)
-    .execute(pool)
-    .await
-    .context("recording Matrix monitor delivery recovery")?;
     Ok(())
 }
 
@@ -1198,25 +1213,27 @@ struct IdempotencyRecord {
     room_id: String,
     encrypted: bool,
     event_id: Option<String>,
+    monitor_verified: Option<bool>,
 }
 
 async fn load_idempotency_record(
     pool: &PgPool,
     request_key: &str,
 ) -> Result<Option<IdempotencyRecord>> {
-    let record: Option<(String, String, bool, Option<String>)> = query_as(
-        "SELECT request_hash, room_id, encrypted, event_id \
+    let record: Option<(String, String, bool, Option<String>, Option<bool>)> = query_as(
+        "SELECT request_hash, room_id, encrypted, event_id, monitor_verified \
          FROM matrix_service.idempotency_records WHERE request_key = $1",
     )
     .bind(request_key)
     .fetch_optional(pool)
     .await
     .context("loading idempotency record")?;
-    Ok(record.map(|(request_hash, room_id, encrypted, event_id)| IdempotencyRecord {
+    Ok(record.map(|(request_hash, room_id, encrypted, event_id, monitor_verified)| IdempotencyRecord {
         request_hash,
         room_id,
         encrypted,
         event_id,
+        monitor_verified,
     }))
 }
 
@@ -1258,6 +1275,26 @@ async fn complete_idempotency_record(
     .execute(pool)
     .await
     .context("completing idempotency record")?;
+    Ok(())
+}
+
+async fn update_monitor_verification(
+    pool: &PgPool,
+    request_key: Option<&str>,
+    monitor_verified: bool,
+) -> Result<()> {
+    let Some(request_key) = request_key else {
+        return Ok(());
+    };
+    query(
+        "UPDATE matrix_service.idempotency_records \
+         SET monitor_verified = $2 WHERE request_key = $1",
+    )
+    .bind(request_key)
+    .bind(monitor_verified)
+    .execute(pool)
+    .await
+    .context("recording Matrix monitor verification result")?;
     Ok(())
 }
 
@@ -1497,5 +1534,32 @@ mod tests {
             monitor_store_directory(root, "@one:example.org"),
             monitor_store_directory(root, "@two:example.org")
         );
+    }
+
+    #[test]
+    fn response_includes_monitor_status_only_for_encrypted_delivery() {
+        let encrypted = serde_json::to_value(SendMessageResponse {
+            event_id: "$event:example.org".into(),
+            image_event_id: None,
+            room_id: "!room:example.org".into(),
+            encrypted: true,
+            monitor_verified: Some(false),
+            idempotent_replay: false,
+            excluded_device_count: 0,
+        })
+        .expect("response is serializable");
+        assert_eq!(encrypted["monitor_verified"], false);
+
+        let plaintext = serde_json::to_value(SendMessageResponse {
+            event_id: "$event:example.org".into(),
+            image_event_id: None,
+            room_id: "!room:example.org".into(),
+            encrypted: false,
+            monitor_verified: None,
+            idempotent_replay: false,
+            excluded_device_count: 0,
+        })
+        .expect("response is serializable");
+        assert!(plaintext.get("monitor_verified").is_none());
     }
 }

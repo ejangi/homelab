@@ -54,7 +54,7 @@ The operator backs up `.env` and its secrets separately. A database backup alone
 
 ### Bootstrap
 
-At service startup, the service logs in using the configured sender and monitor accounts, restores their persistent Matrix client devices where possible, initializes separate crypto stores, uploads any required device keys, and starts synchronization. The monitor account must have joined the default notification room; otherwise setup remains incomplete and reports that membership requirement in the service log. The monitor SDK schema, encryption key derivation, and persisted device ID are identity-scoped: changing `MATRIX_MONITOR_USER_ID` creates a new device and never attempts to reuse another account's crypto store. Startup gives this bootstrap 30 seconds so the health endpoint remains available during an upstream Matrix outage; `POST /v1/setup/bootstrap` retries the operation if startup bootstrap did not complete.
+At service startup, the service logs in using the configured sender and monitor accounts, restores their persistent Matrix client devices where possible, initializes separate crypto stores, uploads any required device keys, and starts synchronization. If a saved SDK session has expired, it reuses the matching persisted service device ID when logging in so the encrypted store remains usable. Sender and monitor sync loops reconnect after transient failures. The monitor account must have joined the default notification room; otherwise setup remains incomplete and reports that membership requirement in the service log. The monitor SDK schema, encryption key derivation, and persisted device ID are identity-scoped: changing `MATRIX_MONITOR_USER_ID` creates a new device and never attempts to reuse another account's crypto store. Startup gives this bootstrap 30 seconds so the health endpoint remains available during an upstream Matrix outage; `POST /v1/setup/bootstrap` retries the operation if startup bootstrap did not complete.
 
 If both the service and SDK state are absent (for example, a new deployment without a restored database), bootstrap creates a new Matrix device. The resulting device cannot decrypt history encrypted for a previously lost device.
 
@@ -64,7 +64,7 @@ The service must never enable encryption as a side effect of a delivery request.
 
 `POST /v1/setup/rooms/{room_id}/enable-encryption` requires an explicit confirmation payload. It checks that the service account is joined to the room and has sufficient power to send the room encryption state event, then enables Matrix E2EE for that room.
 
-`POST /v1/setup/rooms/{room_id}/rotate-encryption-session` requires an explicit `{"confirm": true}` payload and invalidates the active outbound Megolm session through the Matrix SDK. It is an operator recovery action for an unreadable newly-sent event, not a routine delivery operation. The endpoint requires the service account to be joined to an encrypted room; the next encrypted message establishes a fresh session without a service restart. It never edits Matrix crypto-store rows directly.
+`POST /v1/setup/rooms/{room_id}/rotate-encryption-session` requires an explicit `{"confirm": true}` payload and invalidates the active outbound Megolm session through the Matrix SDK. It is an operator recovery action for an unreadable newly-sent event. Following a monitor timeout, the service may also invalidate the session so the next delivery establishes a fresh session; it never re-sends the already accepted event. The endpoint requires the service account to be joined to an encrypted room; the next encrypted message establishes a fresh session without a service restart. It never edits Matrix crypto-store rows directly.
 
 For an encrypted delivery request targeting an unencrypted room, the service returns `ROOM_ENCRYPTION_REQUIRED`. The caller or operator must explicitly enable the room first. Plaintext delivery remains available only when the caller chooses it explicitly.
 
@@ -101,7 +101,7 @@ Rules:
 - `format` is `text`, `markdown`, or `html`; its default is `markdown`.
 - `encrypted` defaults to `true`.
 - `encrypted: true` requires that the room has Matrix encryption enabled. Failure to establish or share encryption state fails the request; no plaintext fallback is permitted.
-- For encrypted delivery, success also requires the separate monitor device to receive and decrypt the returned Matrix event within 45 seconds. On the first timeout, the service records the failure, discards that room's outbound session, and retries the text event once with a new session. A second timeout returns `MATRIX_MONITOR_DECRYPT_TIMEOUT` and leaves an idempotent request incomplete so the caller may retry safely.
+- For encrypted delivery, the service waits up to 45 seconds for the separate monitor device to receive and decrypt the returned Matrix event. A monitor timeout is returned as `monitor_verified: false` on an otherwise successful delivery: Matrix has already accepted the single event, so the service never re-sends its content. It records the failure and discards that room's outbound session so a future delivery establishes a fresh session. This preserves at-most-once visible notification delivery while retaining encryption-health monitoring.
 - `encrypted: false` sends a standard plaintext `m.room.message` only to an unencrypted room. It is refused for encrypted rooms so the SDK can never silently encrypt or downgrade a caller's explicit mode.
 - `request_id` is optional. When supplied, it is an idempotency key scoped to the effective room and request payload.
 - `image_url` is optional. It must be an HTTPS URL on an approved public image CDN (`cdn.shopify.com` for Rushfaster product images, `images.puma.com` for PUMA product images, `res.cloudinary.com` for Proton Blog images, or `i.gr-assets.com` for Goodreads book covers); the service downloads at most 10 MiB, resizes it to fit within 256 × 256 pixels while preserving aspect ratio, encodes it as JPEG, uploads it to Matrix, and sends an `m.image` event before the text message. Redirects are not followed.
@@ -116,6 +116,7 @@ Successful response:
   "image_event_id": "$matrix-image-event-id",
   "room_id": "!gGNQxnBRzxaGuIcEzJ:matrix.org",
   "encrypted": true,
+  "monitor_verified": true,
   "idempotent_replay": false,
   "excluded_device_count": 0
 }
@@ -132,7 +133,7 @@ Failure response:
 }
 ```
 
-The API returns stable machine-readable errors for invalid input, unauthorized API access, missing setup, unencrypted-room refusal, idempotency conflicts, and `MATRIX_MONITOR_DECRYPT_TIMEOUT`. Other Matrix or transport failures are returned as `MATRIX_DELIVERY_FAILED` without exposing internal details.
+The API returns stable machine-readable errors for invalid input, unauthorized API access, missing setup, unencrypted-room refusal, and idempotency conflicts. A monitor timeout is delivery metadata (`monitor_verified: false`), not an HTTP failure. Other Matrix or transport failures are returned as `MATRIX_DELIVERY_FAILED` without exposing internal details.
 
 ## Formatting
 
@@ -151,13 +152,13 @@ For encrypted messages, the Matrix SDK manages device queries, Olm sessions, Meg
 - return `excluded_device_count: 0` in the initial release because the SDK does not expose a reliable per-send exclusion count;
 - serialize crypto mutations so concurrent delivery requests cannot corrupt Matrix crypto state;
 - fail the delivery request if no eligible recipient devices can receive the room key.
-- run a separate monitor account and device with an isolated encrypted SDK store; after every encrypted text event it must persist a receipt only after the SDK has decrypted that event from the sender account. The HTTP delivery response is not successful until this receipt exists.
+- run a separate monitor account and device with an isolated encrypted SDK store; after every encrypted text event it must persist a receipt only after the SDK has decrypted that event from the sender account. The HTTP response reports that verification result without re-sending an event that Matrix has already accepted.
 
-The monitor proves that Matrix accepted the event and room-key share and that a fresh Matrix device decrypted the exact event. When configured with the recipient's own account it additionally tests key sharing to that account, but it still cannot import or inspect an Element client's private crypto store and cannot decrypt events from before that device joined. Matrix E2EE has no recipient-decryption acknowledgement protocol. This separates service-side E2EE failures (monitor timeout) from failures local to a recipient's Element device or its crypto store.
+The monitor proves that Matrix accepted the event and room-key share and that a fresh Matrix device decrypted the exact event. When configured with the recipient's own account it additionally tests key sharing to that account, but it still cannot import or inspect an Element client's private crypto store and cannot decrypt events from before that device joined. Matrix E2EE has no recipient-decryption acknowledgement protocol. A monitor timeout therefore records degraded service-side E2EE health, but does not justify posting a duplicate event to the room.
 
 ## Idempotency and cleanup
 
-When `request_id` is present, the service derives a stable Matrix transaction ID and persists the final delivery outcome. Retrying the same effective request returns the original response without creating another Matrix event.
+When `request_id` is present, the service derives a stable Matrix transaction ID and persists the accepted Matrix event ID before waiting for monitor verification. Retrying the same effective request returns that original event and its recorded verification status without creating another Matrix event.
 
 Reusing a `request_id` with different effective content, room, format, or encryption mode returns `IDEMPOTENCY_CONFLICT`.
 
@@ -220,4 +221,4 @@ The sub-workflow must not store the Matrix password, access token, device ID, cr
 10. The service shares encrypted room keys with non-blocked devices regardless of verification status.
 11. After a restart, the service restores its persisted Matrix device and crypto state automatically; an operator can retry bootstrap through the protected setup API when startup bootstrap fails.
 12. Postgres metadata backup plus a verified Matrix SQLite archive, paired with the separately backed-up store encryption key, restore the service's operational state.
-13. An encrypted delivery returns success only after the independent monitor device decrypts the exact Matrix event; a first monitor timeout automatically creates a replacement session and retries once, while a second timeout is reported as a retryable delivery failure.
+13. An encrypted delivery creates exactly one visible Matrix event. The response reports whether the independent monitor device decrypted that exact event; on a timeout, the service records the failure and prepares a fresh outbound session for a future delivery without re-sending the current message.
