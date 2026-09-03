@@ -23,3 +23,15 @@ _Avoid_: Encryption fallback, automatic downgrade
 **Setup**:
 The authenticated administrative process that initializes the Matrix client device, manages optional verification, and explicitly enables room encryption.
 _Avoid_: Send, delivery
+
+**Radio Blackout (R scale)**:
+The immediate, sunlit-side communications hazard caused by a solar flare's X-ray emission.
+_Avoid_: CME severity, flare arrival
+
+**Solar Radiation Storm (S scale)**:
+The energetic-particle hazard that can affect polar HF communications and spacecraft.
+_Avoid_: Solar flare grade, geomagnetic storm
+
+**Geomagnetic Storm (G scale)**:
+The Earth-magnetic-field disturbance caused by solar-wind conditions, commonly following a CME.
+_Avoid_: Solar flare grade, particle storm

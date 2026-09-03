@@ -1,19 +1,19 @@
 {
-  "name": "DONKI Earth-directed CME alerts",
+  "name": "Space weather alerts",
   "nodes": [
     {
       "parameters": {
         "rule": {
           "interval": [
             {
-              "field": "hours",
-              "hoursInterval": 1
+            "field": "minutes",
+            "minutesInterval": 5
             }
           ]
         }
       },
       "id": "3b376abc-8c9e-4369-a8b2-c7211fbcf02f",
-      "name": "Every hour",
+      "name": "Every 5 minutes",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
       "position": [
@@ -42,12 +42,65 @@
         "jsCode": "const startDate = $now.minus({ days: 2 }).toFormat('yyyy-LL-dd');\nconst endDate = $now.toFormat('yyyy-LL-dd');\n\n// CME records carry links to flare records, but not always the flare class itself.\n// Fetch the same two-day flare window so alerts can use the familiar C/M/X scale.\nlet flares = [];\ntry {\n  const response = await $helpers.httpRequest({\n    method: 'GET',\n    url: 'https://kauai.ccmc.gsfc.nasa.gov/DONKI/WS/get/FLR',\n    qs: { startDate, endDate },\n    json: true,\n    timeout: 30000,\n  });\n  flares = Array.isArray(response) ? response : [];\n} catch (error) {\n  // An Earth-directed CME is still worth alerting on if DONKI's flare feed is late.\n  console.warn(`Could not retrieve DONKI flare classes: ${error.message}`);\n}\n\nconst flaresById = new Map(flares.map((flare) => [flare.flrID, flare]));\nconst now = Date.now();\n\nfunction toMillis(value) {\n  if (!value) return null;\n  const millis = Date.parse(value);\n  return Number.isNaN(millis) ? null : millis;\n}\n\nfunction formatInBrisbane(value) {\n  return new Intl.DateTimeFormat('en-AU', {\n    timeZone: 'Australia/Brisbane',\n    day: '2-digit',\n    month: 'short',\n    year: 'numeric',\n    hour: 'numeric',\n    minute: '2-digit',\n    hour12: true,\n    timeZoneName: 'short',\n  }).format(value);\n}\n\nfunction findEarthForecast(cme) {\n  const forecasts = [];\n  for (const analysis of cme.cmeAnalyses ?? []) {\n    for (const run of analysis.enlilList ?? []) {\n      const earthImpact = (run.impactList ?? []).find((impact) =>\n        String(impact.location ?? '').trim().toLowerCase() === 'earth',\n      );\n      const directedAtEarth = run.isEarthGB === true || run.isEarthMinorImpact === true || Boolean(earthImpact);\n      if (directedAtEarth) {\n        forecasts.push({\n          analysis,\n          run,\n          arrival: run.estimatedShockArrivalTime ?? earthImpact?.arrivalTime ?? null,\n          glancing: run.isEarthGB === true || earthImpact?.isGlancingBlow === true,\n        });\n      }\n    }\n  }\n\n  // Prefer DONKI's most recently completed model run when it has an Earth-impact prediction.\n  return forecasts.sort((a, b) =>\n    (toMillis(b.run.modelCompletionTime) ?? 0) - (toMillis(a.run.modelCompletionTime) ?? 0),\n  )[0];\n}\n\nfunction flareFor(cme) {\n  const flareLink = (cme.linkedEvents ?? []).find((event) =>\n    String(event.activityID ?? '').includes('-FLR-'),\n  );\n  return flareLink ? flaresById.get(flareLink.activityID) : undefined;\n}\n\nfunction arrivalText(arrival) {\n  const when = toMillis(arrival);\n  if (!when) return 'A timing estimate has not been published yet.';\n\n  const hours = Math.max(0, Math.round((when - now) / 3_600_000));\n  const arrivalInBrisbane = formatInBrisbane(new Date(when));\n  if (when >= now) return `About ${hours} hours (${arrivalInBrisbane}).`;\n  return `The forecast time was about ${Math.abs(Math.round((when - now) / 3_600_000))} hours ago (${arrivalInBrisbane}).`;\n}\n\nreturn $input.all()\n  .map((item) => item.json)\n  .filter((cme) => cme?.activityID)\n  .map((cme) => ({ cme, forecast: findEarthForecast(cme) }))\n  .filter(({ forecast }) => forecast)\n  .map(({ cme, forecast }) => {\n    const flare = flareFor(cme);\n    const intensity = flare?.classType ?? 'Not reported';\n    const arrival = forecast.arrival;\n    const reportUrl = cme.link ?? forecast.analysis.link ?? forecast.run.link;\n    const impactDescription = forecast.glancing\n      ? 'A glancing solar eruption is forecast to brush past Earth.'\n      : 'A solar eruption is forecast to affect Earth’s space environment.';\n\n    const message = [\n      '☀️ **Earth-directed solar eruption**',\n      '',\n      impactDescription,\n      `Solar flare intensity: **${intensity}**`,\n      `Estimated Earth arrival: **${arrivalText(arrival)}**`,\n      '',\n      '_This is a space-weather forecast, not a ground-level impact forecast._',\n      reportUrl ? `[Read the full DONKI observation](${reportUrl})` : null,\n    ].filter(Boolean).join('\\n');\n\n    return {\n      json: {\n        cme_id: cme.activityID,\n        first_seen_at: new Date().toISOString(),\n        arrival_at: arrival,\n        intensity,\n        observation_url: reportUrl,\n        message,\n        matrix_request_id: `donki-cme-${cme.activityID}`,\n      },\n    };\n  });"
       },
       "id": "cf6ee308-dd15-4bb5-9d02-89e82a7ecfe7",
-      "name": "Prepare Earth-directed CME alerts",
+      "name": "Legacy CME alert preparation (disabled)",
+      "disabled": true,
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
         -420,
-        0
+        -180
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const now = Date.now();\nconst state = $getWorkflowStaticData('global');\nconst previousSwpcPoll = Date.parse(state.lastSwpcPoll ?? '');\n\nlet swpcAlerts = [];\nlet swpcAvailable = false;\ntry {\n  const response = await $helpers.httpRequest({\n    method: 'GET',\n    url: 'https://services.swpc.noaa.gov/products/alerts.json',\n    json: true,\n    timeout: 30000,\n  });\n  swpcAlerts = Array.isArray(response) ? response : [];\n  swpcAvailable = true;\n} catch (error) {\n  console.warn('Could not retrieve NOAA SWPC alerts: ' + error.message);\n}\nif (swpcAvailable) state.lastSwpcPoll = new Date(now).toISOString();\n\nfunction toMillis(value) {\n  const result = Date.parse(value ?? '');\n  return Number.isNaN(result) ? null : result;\n}\n\nfunction brisbaneTime(value) {\n  return new Intl.DateTimeFormat('en-AU', {\n    timeZone: 'Australia/Brisbane', day: '2-digit', month: 'short',\n    hour: 'numeric', minute: '2-digit', hour12: true, timeZoneName: 'short',\n  }).format(new Date(value));\n}\n\nfunction earthForecast(cme) {\n  const matches = [];\n  for (const analysis of cme.cmeAnalyses ?? []) {\n    for (const run of analysis.enlilList ?? []) {\n      const impact = (run.impactList ?? []).find((item) =>\n        String(item.location ?? '').trim().toLowerCase() === 'earth',\n      );\n      if (run.isEarthGB === true || run.isEarthMinorImpact === true || impact) {\n        matches.push({ run, analysis, arrival: run.estimatedShockArrivalTime ?? impact?.arrivalTime ?? null });\n      }\n    }\n  }\n  return matches.sort((a, b) => (toMillis(b.run.modelCompletionTime) ?? 0) - (toMillis(a.run.modelCompletionTime) ?? 0))[0];\n}\n\nfunction number(value) {\n  return typeof value === 'number' ? value : null;\n}\n\nfunction eta(arrival) {\n  const when = toMillis(arrival);\n  if (!when) return 'Timing has not been published.';\n  const hours = Math.max(0, Math.round((when - now) / 3600000));\n  return when >= now ? '~' + hours + ' h — ' + brisbaneTime(when) : 'Forecast time passed — ' + brisbaneTime(when);\n}\n\nfunction report(id, intensity, arrival, url, message) {\n  return {\n    cme_id: id,\n    first_seen_at: new Date(now).toISOString(),\n    arrival_at: arrival,\n    intensity,\n    observation_url: url,\n    message,\n    matrix_request_id: 'space-weather-' + id,\n  };\n}\n\nconst cmeReports = $input.all()\n  .map((item) => item.json)\n  .filter((cme) => cme?.activityID)\n  .map((cme) => ({ cme, forecast: earthForecast(cme) }))\n  .filter(({ forecast }) => number(forecast.run.kp_135) >= 6)\n  .map(({ cme, forecast }) => {\n    const adverseKp = number(forecast.run.kp_180) ?? number(forecast.run.kp_135);\n    const strong = adverseKp >= 7;\n    const level = strong ? 'possible G3 strong storm' : 'possible G2 moderate storm';\n    const effects = strong\n      ? 'Expect possible intermittent HF/GPS disruption and satellite effects.'\n      : 'Expect possible HF fading and satellite effects, mainly at high latitudes.';\n    const url = cme.link ?? forecast.analysis.link ?? forecast.run.link;\n    return report(\n      cme.activityID,\n      strong ? 'G3 possible' : 'G2 possible',\n      forecast.arrival,\n      url,\n      ['🧲 **CME ARRIVAL — ' + level + '**', 'ETA: **' + eta(forecast.arrival) + '**', effects, url ? '[Forecast](' + url + ')' : null].filter(Boolean).join('\\n'),\n    );\n  });\n\nfunction issueMillis(alert) {\n  const value = String(alert.issue_datetime ?? '').trim().replace(' ', 'T');\n  return toMillis(value ? value + 'Z' : '');\n}\n\nfunction swpcReport(alert) {\n  const message = String(alert.message ?? '');\n  const scale = message.match(/Noaa Scale:\\s*([RS][1-5])\\s*-\\s*([A-Za-z]+)/i);\n  const serial = message.match(/Serial Number:\\s*(\\d+)/i);\n  if (!scale || !serial || !/^(ALERT|WARNING):/m.test(message)) return null;\n  if (!Number.isFinite(previousSwpcPoll) || (issueMillis(alert) ?? 0) <= previousSwpcPoll - 60000) return null;\n\n  const level = scale[1].toUpperCase() + ' ' + scale[2];\n  const radiation = scale[1].toUpperCase().startsWith('S');\n  const title = radiation ? '☢️ **PARTICLE STORM — ' + level + '**' : '☀️ **SOLAR FLARE — ' + level + '**';\n  const effects = radiation\n    ? 'Polar HF and satellite radiation impacts may be underway.'\n    : 'HF radio disruption may be underway on Earth’s sunlit side.';\n  const id = 'swpc-' + String(alert.product_id ?? 'alert') + '-' + serial[1];\n  return report(\n    id,\n    level,\n    new Date(issueMillis(alert) ?? now).toISOString(),\n    'https://www.swpc.noaa.gov/products/alerts',\n    [title, effects, '[Details](https://www.swpc.noaa.gov/products/alerts)'].join('\\n'),\n  );\n}\n\nconst swpcReports = swpcAvailable ? swpcAlerts.map(swpcReport).filter(Boolean) : [];\nreturn [...cmeReports, ...swpcReports].map((json) => ({ json, pairedItem: { item: 0 } }));"
+      },
+      "id": "b07d5125-1c88-4e2b-a7c5-028aaa735a12",
+      "name": "Prepare concise space weather alerts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -420,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const alert = $input.item.json;\n\nreturn [{\n  json: {\n    ...alert,\n    message: String(alert.message ?? '').replace(/\\n+/g, '\\n\\n'),\n  },\n  pairedItem: { item: 0 },\n}];"
+      },
+      "id": "6d52c43a-9d5d-49ea-b5d6-18725da085fd",
+      "name": "Format alert text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -160,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const alert = $input.item.json;\nconst intensity = String(alert.intensity ?? '');\n\nfunction reportedAt(value) {\n  const when = Date.parse(value ?? '');\n  if (Number.isNaN(when)) return 'just now';\n  return new Intl.DateTimeFormat('en-AU', {\n    timeZone: 'Australia/Brisbane', day: '2-digit', month: 'short',\n    hour: 'numeric', minute: '2-digit', hour12: true, timeZoneName: 'short',\n  }).format(new Date(when));\n}\n\nconst sections = String(alert.message ?? '').split('\\n\\n');\nif (intensity.startsWith('R')) {\n  sections.splice(1, 0, 'Reported: **' + reportedAt(alert.arrival_at) + '**', 'Status: **already underway** — Sun–Earth light time is ~8 min.');\n} else if (intensity.startsWith('S')) {\n  sections.splice(1, 0, 'Reported: **' + reportedAt(alert.arrival_at) + '**', 'Status: **may already be underway** — particle travel time is not fixed.');\n}\n\nreturn [{\n  json: { ...alert, message: sections.join('\\n\\n') },\n  pairedItem: { item: 0 },\n}];"
+      },
+      "id": "97869707-e502-46d4-aae8-cdc87e5f16f4",
+      "name": "Add immediate-alert timing",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        80,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const alert = $input.item.json;\nconst scaleUrl = 'https://www.swpc.noaa.gov/node/1085';\nlet message = String(alert.message ?? '').replace(/\\n\\n\\[Forecast\\]\\([^)]*\\)$/, '');\n\nif (String(alert.intensity ?? '').startsWith('G') && alert.observation_url) {\n  message += '\\n\\n[DONKI CME observation](' + alert.observation_url + ')';\n}\nmessage += '\\n\\n[NOAA scale definitions](' + scaleUrl + ')';\n\nreturn [{\n  json: { ...alert, message },\n  pairedItem: { item: 0 },\n}];"
+      },
+      "id": "f6158015-c469-4c34-8196-1f0fe05e0616",
+      "name": "Add alert references",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        340,
+        100
       ]
     },
     {
@@ -58,7 +111,7 @@
           "__rl": true,
           "value": "5VZQ0mT7Rzd0cS5g",
           "mode": "list",
-          "cachedResultName": "DONKI CME Reports"
+          "cachedResultName": "Space Weather Alerts"
         },
         "matchType": "allConditions",
         "filters": {
@@ -72,7 +125,7 @@
         }
       },
       "id": "3c58c795-b264-45d3-94d8-d93b6363676b",
-      "name": "Only new CME reports",
+      "name": "Only new space weather alerts",
       "type": "n8n-nodes-base.dataTable",
       "typeVersion": 1.1,
       "position": [
@@ -162,10 +215,10 @@
     {
       "parameters": {
         "mode": "runOnceForEachItem",
-        "jsCode": "const report = $('Prepare Earth-directed CME alerts').item.json;\n\nreturn {\n  json: {\n    cme_id: report.cme_id,\n    first_seen_at: report.first_seen_at,\n    arrival_at: report.arrival_at,\n    intensity: report.intensity,\n    observation_url: report.observation_url,\n    matrix_event_id: $json.event_id ?? null,\n  },\n};"
+        "jsCode": "const report = $('Prepare concise space weather alerts').item.json;\n\nreturn {\n  json: {\n    cme_id: report.cme_id,\n    first_seen_at: report.first_seen_at,\n    arrival_at: report.arrival_at,\n    intensity: report.intensity,\n    observation_url: report.observation_url,\n    matrix_event_id: $json.event_id ?? null,\n  },\n};"
       },
       "id": "e95ab926-5bd7-44db-b464-899572c1ab09",
-      "name": "Prepare CME report record",
+      "name": "Prepare space weather alert record",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
@@ -181,7 +234,7 @@
           "__rl": true,
           "value": "5VZQ0mT7Rzd0cS5g",
           "mode": "list",
-          "cachedResultName": "DONKI CME Reports"
+          "cachedResultName": "Space Weather Alerts"
         },
         "columns": {
           "mappingMode": "autoMapInputData",
@@ -246,7 +299,7 @@
         "options": {}
       },
       "id": "7c8ed8d7-712e-4d83-b2de-9ec087feb9f5",
-      "name": "Record seen CME report",
+      "name": "Record sent space weather alert",
       "type": "n8n-nodes-base.dataTable",
       "typeVersion": 1.1,
       "position": [
@@ -256,7 +309,7 @@
     }
   ],
   "connections": {
-    "Every hour": {
+    "Every 5 minutes": {
       "main": [
         [
           {
@@ -271,25 +324,58 @@
       "main": [
         [
           {
-            "node": "Prepare Earth-directed CME alerts",
+            "node": "Prepare concise space weather alerts",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Prepare Earth-directed CME alerts": {
+    "Prepare concise space weather alerts": {
       "main": [
         [
           {
-            "node": "Only new CME reports",
+            "node": "Add immediate-alert timing",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Only new CME reports": {
+    "Add immediate-alert timing": {
+      "main": [
+        [
+          {
+            "node": "Format alert text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add alert references": {
+      "main": [
+        [
+          {
+            "node": "Only new space weather alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format alert text": {
+      "main": [
+        [
+          {
+            "node": "Add alert references",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Only new space weather alerts": {
       "main": [
         [
           {
@@ -304,18 +390,18 @@
       "main": [
         [
           {
-            "node": "Prepare CME report record",
+            "node": "Prepare space weather alert record",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Prepare CME report record": {
+    "Prepare space weather alert record": {
       "main": [
         [
           {
-            "node": "Record seen CME report",
+            "node": "Record sent space weather alert",
             "type": "main",
             "index": 0
           }
