@@ -1,7 +1,4 @@
 # Common routing for the Tailscale hostname and the local diagnostic listener.
-# Immich must occupy a host root; it does not support a sub-path such as
-# /photos. The specific /n8n, /matrix, and /files routes continue to take
-# precedence over the Immich fallback.
 (service_routes) {
     log
 
@@ -38,15 +35,8 @@
         reverse_proxy sftpgo:8080
     }
 
-    # Immich is available only to Tailscale peers. Keep this as the final
-    # fallback because `handle` blocks are mutually exclusive.
-    @tailscale remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48
-    handle @tailscale {
-        reverse_proxy immich_server:2283
-    }
-
     handle {
-        respond "Tailscale access required" 403
+        respond "Not found" 404
     }
 }
 
