@@ -2,9 +2,20 @@
 (service_routes) {
     log
 
-    # 1. N8N Proxy Block: Match requests starting with /n8n/
+    # Correct accidental duplicate prefixes before they reach n8n. The rewrite
+    # preserves any suffix and query string for login/API redirects.
+    @duplicated_n8n path_regexp duplicated_n8n ^/n8n/n8n(?:/|$)
+    handle @duplicated_n8n {
+        route {
+            uri replace /n8n/n8n /n8n 1
+            redir {uri} 302
+        }
+    }
+
+    # 1. N8N Proxy Block: Match requests starting with /n8n/.
+    # N8N_PATH makes n8n generate public URLs below /n8n/, while its upstream
+    # routes (including static assets) remain rooted at /. Strip only at Caddy.
     handle /n8n* {
-        # CRITICAL: Strip the /n8n prefix from the URI before forwarding
         uri strip_prefix /n8n
 
         reverse_proxy n8n:5678 {
