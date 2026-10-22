@@ -1,0 +1,387 @@
+{
+  "name": "BleepingComputer article alerts",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "56fb039e-30e2-4a81-99be-635ea08ad0f7",
+      "name": "Every hour",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -920,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "9565d3a9-1714-460a-b3db-0cb748a3a252",
+      "name": "Run on demand",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -920,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://www.bleepingcomputer.com/feed/",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "7a7259d9-6881-468d-a081-6bedc8f456ec",
+      "name": "Fetch BleepingComputer RSS feed",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1,
+      "position": [
+        -680,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function decodeEntities(value) {\n  const named = { amp: '&', apos: \"'\", gt: '>', lt: '<', nbsp: ' ', quot: '\"' };\n  return value.replace(/&(#x[0-9a-f]+|#\\d+|[a-z]+);/gi, (entity, reference) => {\n    const lower = reference.toLowerCase();\n    if (lower[0] !== '#') return named[lower] ?? entity;\n    const codePoint = lower.startsWith('#x') ? Number.parseInt(lower.slice(2), 16) : Number.parseInt(lower.slice(1), 10);\n    try { return String.fromCodePoint(codePoint); } catch { return entity; }\n  });\n}\n\nfunction toPlainText(value) {\n  return decodeEntities(value.replace(/<script[\\s\\S]*?<\\/script>|<style[\\s\\S]*?<\\/style>/gi, '').replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim());\n}\n\nfunction escapeMarkdown(value) { return value.replace(/([\\\\`*_{}[\\]<>])/g, '\\\\$1'); }\n\nfunction compact(value, maxLength) { return value.length <= maxLength ? value : `${value.slice(0, maxLength - 1).trimEnd()}…`; }\n\nfunction requestIdFor(value) {\n  let hash = 5381;\n  for (const character of value) hash = ((hash << 5) + hash) ^ character.charCodeAt(0);\n  return `bleepingcomputer-${(hash >>> 0).toString(36)}`;\n}\n\nfunction linkTarget(url) { return url.replace(/\\s/g, '%20').replace(/\\(/g, '%28').replace(/\\)/g, '%29'); }\n\nconst articles = $input.all().flatMap((item) => {\n  const article = item.json;\n  const articleUrl = String(article.link ?? '').trim();\n  const articleId = String(article.guid ?? articleUrl).trim();\n  const title = toPlainText(String(article.title ?? ''));\n  if (!articleId || !title) return [];\n\n  if (!/^https:\\/\\/www\\.bleepingcomputer\\.com\\//.test(articleUrl)) return [];\n\n  // BleepingComputer ends every teaser with a trailing \"[...]\" marker.\n  const description = compact(toPlainText(String(article.contentSnippet ?? article.content ?? article.description ?? '')).replace(/\\s*\\[(?:\\.{3}|…)\\]$/, ''), 700);\n  const categories = [...new Set((Array.isArray(article.categories) ? article.categories : []).map((category) => toPlainText(String(category))).filter(Boolean))];\n\n  const published = new Date(article.isoDate ?? article.pubDate ?? '');\n  const publishedAt = Number.isNaN(published.valueOf()) ? null : published.toISOString();\n\n  return [{\n    json: {\n      article_id: articleId,\n      title,\n      categories: categories.join(', '),\n      description,\n      article_url: articleUrl,\n      published_at: publishedAt,\n      first_seen_at: new Date().toISOString(),\n      message: [\n        `📰 **[${escapeMarkdown(title)}](${linkTarget(articleUrl)})**`,\n        categories.length ? `🏷️ ${categories.map(escapeMarkdown).join(' · ')}` : null,\n        description ? escapeMarkdown(description) : null,\n      ].filter((line) => line !== null).join('\\n\\n'),\n      matrix_request_id: requestIdFor(articleId),\n    },\n  }];\n});\n\n// Deliver oldest first so Matrix shows articles in publication order.\nreturn articles.sort((a, b) => String(a.json.published_at ?? '').localeCompare(String(b.json.published_at ?? '')));"
+      },
+      "id": "0053d81e-d5f0-4c37-b4dc-498b4f95163a",
+      "name": "Prepare BleepingComputer articles",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -420,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "rowNotExists",
+        "dataTableId": {
+          "__rl": true,
+          "value": "mn5MSumugjFLBbxO",
+          "mode": "list",
+          "cachedResultName": "BleepingComputer Articles"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "article_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.article_id }}"
+            }
+          ]
+        }
+      },
+      "id": "1b1126fe-3b4f-438d-8780-58426a246a37",
+      "name": "Only new BleepingComputer articles",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        -160,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "wv07Z6jDBKWlgksk",
+          "mode": "list",
+          "cachedResultName": "Matrix Sender"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "message": "={{ $json.message }}",
+            "format": "markdown",
+            "encrypted": true,
+            "request_id": "={{ $json.matrix_request_id }}"
+          },
+          "schema": [
+            {
+              "id": "message",
+              "displayName": "message",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "room_id",
+              "displayName": "room_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "format",
+              "displayName": "format",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "encrypted",
+              "displayName": "encrypted",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "request_id",
+              "displayName": "request_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "image_url",
+              "displayName": "image_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "image_alt",
+              "displayName": "image_alt",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "mode": "each",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "7652454c-a5b9-4221-ba38-f3b4f483eb3a",
+      "name": "Send Matrix notification",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        100,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const article = $('Prepare BleepingComputer articles').item.json;\nreturn { json: { article_id: article.article_id, title: article.title, categories: article.categories, description: article.description, article_url: article.article_url, published_at: article.published_at, first_seen_at: article.first_seen_at, matrix_event_id: $json.event_id ?? null } };"
+      },
+      "id": "0202d98c-3a1e-4c4e-891c-be7623e4f06c",
+      "name": "Prepare seen BleepingComputer article record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        360,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "value": "mn5MSumugjFLBbxO",
+          "mode": "list",
+          "cachedResultName": "BleepingComputer Articles"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "schema": [
+            {
+              "id": "article_id",
+              "displayName": "article_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "title",
+              "displayName": "title",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "categories",
+              "displayName": "categories",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "description",
+              "displayName": "description",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "article_url",
+              "displayName": "article_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "published_at",
+              "displayName": "published_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "date",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "first_seen_at",
+              "displayName": "first_seen_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "date",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "matrix_event_id",
+              "displayName": "matrix_event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "00a64d61-9693-4a4e-ac6d-33a22e791612",
+      "name": "Record seen BleepingComputer article",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        620,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Every hour": {
+      "main": [
+        [
+          {
+            "node": "Fetch BleepingComputer RSS feed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run on demand": {
+      "main": [
+        [
+          {
+            "node": "Fetch BleepingComputer RSS feed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch BleepingComputer RSS feed": {
+      "main": [
+        [
+          {
+            "node": "Prepare BleepingComputer articles",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare BleepingComputer articles": {
+      "main": [
+        [
+          {
+            "node": "Only new BleepingComputer articles",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Only new BleepingComputer articles": {
+      "main": [
+        [
+          {
+            "node": "Send Matrix notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Matrix notification": {
+      "main": [
+        [
+          {
+            "node": "Prepare seen BleepingComputer article record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare seen BleepingComputer article record": {
+      "main": [
+        [
+          {
+            "node": "Record seen BleepingComputer article",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {"executionOrder": "v1", "timezone": "Australia/Brisbane", "errorWorkflow": "fOszDr3Us7EmONPm"}
+}

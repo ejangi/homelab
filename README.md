@@ -92,3 +92,11 @@ The [src/goodreads/](src/goodreads/) workflow checks the configured Goodreads
 genre API every day, records each delivered book in the `Goodreads Science
 Fiction Books` n8n data table, and sends newly listed books through Matrix
 Sender with their Goodreads cover image.
+
+## BleepingComputer article alerts
+
+The [src/bleepingcomputer/](src/bleepingcomputer/) workflow reads the
+BleepingComputer RSS feed every hour, records each delivered article in the
+`BleepingComputer Articles` n8n data table, and sends new articles through
+Matrix Sender. Each message links the title to the article and includes its
+categories and description.
