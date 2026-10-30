@@ -1,0 +1,419 @@
+{
+  "name": "AdGuard DNS query log archive",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "a61eb12d-d5d3-4302-9d30-24b259b128df",
+      "name": "Every 15 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1000,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "e95d0e5a-1e3c-4278-ba05-10109b7f8253",
+      "name": "Manual collection",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1000,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const now = Date.now();\nreturn [{json: {since: new Date(now - 60*60*1000).toISOString(), expireBefore: new Date(now - 7*24*60*60*1000).toISOString()}}];"
+      },
+      "id": "f60270a5-92a2-41f9-8395-2e0e76c6825b",
+      "name": "Collection window",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -780,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "deleteRows",
+        "dataTableId": {
+          "__rl": true,
+          "value": "JkQHRhdOamhupNb1",
+          "mode": "list",
+          "cachedResultName": "AdGuard DNS Query Logs"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "queried_at",
+              "condition": "lt",
+              "keyValue": "={{ $('Collection window').first().json.expireBefore }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "4936e870-c90c-4875-a7c5-736a2ee7fcc8",
+      "name": "Delete queries older than seven days",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        -550,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "JkQHRhdOamhupNb1",
+          "mode": "list",
+          "cachedResultName": "AdGuard DNS Query Logs"
+        },
+        "returnAll": true,
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "queried_at",
+              "condition": "gte",
+              "keyValue": "={{ $('Collection window').first().json.since }}"
+            }
+          ]
+        }
+      },
+      "id": "fbd35251-c071-4ce7-9bb6-4f0e7307c28b",
+      "name": "Read recent stored queries",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        -300,
+        0
+      ],
+      "alwaysOutputData": true,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "url": "http://10.0.0.1:3000/control/querylog",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "limit",
+              "value": "1000"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "older_than",
+                    "value": "={{ $pageCount === 0 ? '' : $response.body.oldest }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !Array.isArray($response.body.data) || $response.body.data.length === 0 || !$response.body.oldest || Date.parse($response.body.oldest) <= Date.parse($('Collection window').first().json.since) }}",
+              "limitPagesFetched": true,
+              "maxRequests": 200,
+              "requestInterval": 100
+            }
+          }
+        }
+      },
+      "id": "373fe8fa-1aa7-4ee3-a7e6-5ae7b9d02015",
+      "name": "Fetch AdGuard query-log pages",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        -50,
+        0
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "bYH5WNvh9iEXnFoK",
+          "name": "AdGuard Home router"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Keep the original nanosecond timestamp in query_id and raw_json. Date columns\n// have millisecond precision, which cannot safely identify individual queries.\nconst window = $('Collection window').first().json;\nconst pages = $input.all().map(item => item.json);\nconst last = pages.at(-1);\nif (!last || !Array.isArray(last.data)) throw new Error('Invalid AdGuard query-log response');\nif (pages.length >= 200 && last.data.length && last.oldest && Date.parse(last.oldest) > Date.parse(window.since)) {\n  throw new Error('AdGuard pagination limit reached before the collection window was covered');\n}\nconst known = new Set($('Read recent stored queries').all().map(item => item.json.query_id).filter(Boolean));\nconst rows = [];\nfor (const page of pages) {\n  if (!Array.isArray(page.data)) throw new Error('Invalid AdGuard query-log page');\n  for (const query of page.data) {\n    const time = Date.parse(query.time);\n    if (!Number.isFinite(time) || !query.client || !query.question?.name) throw new Error('Malformed AdGuard query record');\n    if (time < Date.parse(window.since)) continue;\n    const query_id = JSON.stringify([query.time, query.client, query.question.class, query.question.name, query.question.type, query.client_proto ?? '']);\n    if (known.has(query_id)) continue;\n    known.add(query_id);\n    rows.push({ json: {\n      query_id,\n      queried_at: new Date(time).toISOString(),\n      client: query.client,\n      client_name: query.client_info?.name ?? '',\n      domain: query.question.name,\n      query_type: query.question.type ?? '',\n      status: query.status ?? '',\n      reason: query.reason ?? '',\n      blocked: /^Filtered/.test(query.reason ?? ''),\n      cached: query.cached === true,\n      elapsed_ms: Number.isFinite(Number(query.elapsedMs)) ? Number(query.elapsedMs) : null,\n      upstream: query.upstream ?? '',\n      raw_json: JSON.stringify(query),\n    }});\n  }\n}\nreturn rows;\n"
+      },
+      "id": "254731eb-b3cb-4b7c-84ae-a6a0b461c575",
+      "name": "Prepare new query rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        200,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "value": "JkQHRhdOamhupNb1",
+          "mode": "list",
+          "cachedResultName": "AdGuard DNS Query Logs"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "schema": [
+            {
+              "id": "query_id",
+              "displayName": "query_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "queried_at",
+              "displayName": "queried_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "date",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "client",
+              "displayName": "client",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "client_name",
+              "displayName": "client_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "domain",
+              "displayName": "domain",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "query_type",
+              "displayName": "query_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "reason",
+              "displayName": "reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "blocked",
+              "displayName": "blocked",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "cached",
+              "displayName": "cached",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "elapsed_ms",
+              "displayName": "elapsed_ms",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "upstream",
+              "displayName": "upstream",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "raw_json",
+              "displayName": "raw_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {
+          "optimizeBulk": true
+        }
+      },
+      "id": "851ec116-5db5-42da-8a56-44045e89b1a2",
+      "name": "Store new queries",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        450,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Every 15 minutes": {
+      "main": [
+        [
+          {
+            "node": "Collection window",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collection window": {
+      "main": [
+        [
+          {
+            "node": "Delete queries older than seven days",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete queries older than seven days": {
+      "main": [
+        [
+          {
+            "node": "Read recent stored queries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read recent stored queries": {
+      "main": [
+        [
+          {
+            "node": "Fetch AdGuard query-log pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch AdGuard query-log pages": {
+      "main": [
+        [
+          {
+            "node": "Prepare new query rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare new query rows": {
+      "main": [
+        [
+          {
+            "node": "Store new queries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual collection": {
+      "main": [
+        [
+          {
+            "node": "Collection window",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Australia/Brisbane",
+    "errorWorkflow": "fOszDr3Us7EmONPm",
+    "executionTimeout": 600,
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "none",
+    "saveManualExecutions": false
+  }
+}

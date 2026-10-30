@@ -33,6 +33,8 @@ services:
       # Required by the Matrix Sender workflow, whose documented contract uses
       # environment-backed Matrix Service URL and API-key expressions.
       - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      # Seven days of DNS query logs share this allowance with other data tables.
+      - N8N_DATA_TABLES_MAX_SIZE_BYTES=${N8N_DATA_TABLES_MAX_SIZE_BYTES:-1073741824}
       # Internal Matrix notification service
       - MATRIX_SERVICE_URL=${MATRIX_SERVICE_URL}
       - MATRIX_SERVICE_API_KEY=${MATRIX_SERVICE_API_KEY}

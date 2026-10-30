@@ -79,6 +79,12 @@ enter the SMB address above, choose **Registered User**, and enter username
 away from the home network. SMB is exposed on TCP port 445 and does not use
 Caddy or the `/files` URL.
 
+## AdGuard DNS query logs
+
+The **AdGuard DNS query log archive** workflow collects router query logs every
+15 minutes into the **AdGuard DNS Query Logs** n8n data table and keeps a rolling
+seven days. See [setup and maintenance](docs/adguard-query-log-archive.md).
+
 ## DONKI CME alerts
 
 The [src/donki/](src/donki/) directory contains the n8n workflow definition for
