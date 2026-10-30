@@ -179,7 +179,8 @@
       "position": [
         200,
         0
-      ]
+      ],
+      "alwaysOutputData": true
     },
     {
       "parameters": {
@@ -326,6 +327,62 @@
         450,
         0
       ]
+    },
+    {
+      "id": "8137f24c-2b6d-4af2-b79c-500de5937b4d",
+      "name": "Has new queries",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        430,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "eb627aeb-85a8-4518-98b1-137dc312d917",
+              "leftValue": "={{ $json.query_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "a3817f85-a2b4-455c-ac5b-a577b762d536",
+      "name": "Notify blocked requests",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        950,
+        0
+      ],
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "Ubrl1onhTqN2sE5v",
+          "mode": "list",
+          "cachedResultName": "AdGuard blocked request notifications"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
     }
   ],
   "connections": {
@@ -388,7 +445,7 @@
       "main": [
         [
           {
-            "node": "Store new queries",
+            "node": "Has new queries",
             "type": "main",
             "index": 0
           }
@@ -400,6 +457,35 @@
         [
           {
             "node": "Collection window",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has new queries": {
+      "main": [
+        [
+          {
+            "node": "Store new queries",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify blocked requests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store new queries": {
+      "main": [
+        [
+          {
+            "node": "Notify blocked requests",
             "type": "main",
             "index": 0
           }

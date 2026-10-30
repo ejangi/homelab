@@ -69,3 +69,48 @@ duplicate IDs, deletion of a seeded eight-day-old record, and an active final
 schedule with no development webhook.
 
 API reference: [AdGuard Home OpenAPI](https://github.com/AdguardTeam/AdGuardHome/blob/master/openapi/openapi.yaml).
+
+## Matrix blocked-request notifications
+
+After archiving, the parent calls **AdGuard blocked request notifications**
+(`Ubrl1onhTqN2sE5v`), including on runs with no newly archived queries so failed
+notifications can be retried. The child sends nothing when no blocked queries
+are awaiting delivery. It groups requests by normalized domain and client
+address, displaying the client name or its address when unnamed. The HTML table
+shows domain, client, and blocked-request count, sorted by descending count.
+Reporting timestamps use Australia/Brisbane. Tables split at 40 rows or a
+conservative message-size threshold; each part reports its own totals.
+
+The **AdGuard Matrix Notification Batches** data table (`gQtwYFaDvtjVUHHj`)
+is an outbox with `batch_id` (string), `message` (string), `query_ids` (string
+containing a JSON array), `delivered` (boolean), `matrix_event_id` (string), and
+`prepared_at` (date). Query IDs in both pending and completed batches prevent
+repeat notifications from the overlapping collection window. Immutable batches
+are inserted before delivery; the Matrix Sender uses `batch_id` as its request
+ID. A batch is marked delivered only after the sender succeeds. A failure after
+Matrix accepts a message therefore retries the same payload and idempotency key.
+Delivered batches are pruned after eight days, beyond query retention; pending
+batches remain available for retry. The table stores DNS notification content
+and is covered by the existing Postgres backups. Do not run concurrent parent
+or child executions: the outbox check and insert are not a transactional lock.
+
+Initial notification coverage starts at 30 October 2026, 12:16 pm AEST; older
+archived queries are intentionally excluded. Undelivered queries remain eligible
+while present in the seven-day archive. Pending prepared batches can outlive
+that archive; recover delivery within the Matrix service's 30-day idempotency
+retention to preserve duplicate suppression after an ambiguous delivery failure.
+
+The child definition is
+[`src/adguard/adguard-blocked-notifications-workflow.json`](../src/adguard/adguard-blocked-notifications-workflow.json),
+with grouping source in
+[`src/adguard/prepare-blocked-notifications.js`](../src/adguard/prepare-blocked-notifications.js).
+Keep the embedded Code node synchronized. On another instance, create the
+outbox columns above, select both tables and the Matrix Sender, adjust the
+coverage-start filter, publish the child, then select it in and publish the
+parent. Successful and failed execution payload retention remains disabled.
+
+Run `node scripts/test-adguard-blocked-notifications.cjs` for grouping, escaping,
+address fallback, duplicate suppression, empty runs, and message splitting.
+Live verification sent a labelled fictional-client preview through the child,
+confirmed a single delivered outbox batch, and reran it without another delivery.
+The temporary webhook workflows and seeded query records were removed.

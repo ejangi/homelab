@@ -1,0 +1,562 @@
+{
+  "name": "AdGuard blocked request notifications",
+  "nodes": [
+    {
+      "id": "52448926-0d58-4156-84dd-d0fd0fb6bff0",
+      "name": "Notification request",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "2d195544-9c9f-4d18-837d-e6cfbed046ed",
+      "name": "Prune delivered batches",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "deleteRows",
+        "dataTableId": {
+          "__rl": true,
+          "value": "gQtwYFaDvtjVUHHj",
+          "mode": "list",
+          "cachedResultName": "AdGuard Matrix Notification Batches"
+        },
+        "options": {},
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "delivered",
+              "condition": "eq",
+              "keyValue": true
+            },
+            {
+              "keyName": "prepared_at",
+              "condition": "lt",
+              "keyValue": "={{ $now.minus({days:8}).toISO() }}"
+            }
+          ]
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "2e07b953-1398-4821-b17c-88d3ac270c21",
+      "name": "Read blocked queries",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        480,
+        0
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "JkQHRhdOamhupNb1",
+          "mode": "list"
+        },
+        "returnAll": true,
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "blocked",
+              "condition": "eq",
+              "keyValue": true
+            },
+            {
+              "keyName": "queried_at",
+              "condition": "gte",
+              "keyValue": "2026-10-30T02:16:28.840502+00:00"
+            }
+          ]
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "3fa81bf2-c066-43ee-a361-ea892b4cafe4",
+      "name": "Read notification batches",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        720,
+        0
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "gQtwYFaDvtjVUHHj",
+          "mode": "list",
+          "cachedResultName": "AdGuard Matrix Notification Batches"
+        },
+        "returnAll": true
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "8789eaad-4a3f-43cd-a270-a5fd48425b61",
+      "name": "Prepare notification batches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Persist these immutable batches before delivery so retries reuse the same payload.\nconst known = new Set();\nfor (const {json: batch} of $('Read notification batches').all()) {\n  for (const id of JSON.parse(batch.query_ids || '[]')) known.add(id);\n}\nconst queries = $('Read blocked queries').all().map(i => i.json)\n  .filter(q => q.query_id && q.blocked === true && !known.has(q.query_id));\nconst groups = new Map();\nfor (const q of queries) {\n  if (known.has(q.query_id)) continue;\n  known.add(q.query_id);\n  const domain = q.domain.toLowerCase().replace(/\\.$/, '');\n  const key = JSON.stringify([domain, q.client]);\n  if (!groups.has(key)) groups.set(key, {domain, client: q.client_name?.trim() || q.client, queries: []});\n  groups.get(key).queries.push(q);\n}\nconst rows = [...groups.values()].sort((a,b) => b.queries.length-a.queries.length || a.domain.localeCompare(b.domain) || a.client.localeCompare(b.client));\nconst escape = s => String(s).replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));\nconst time = value => new Intl.DateTimeFormat('en-AU', {timeZone:'Australia/Brisbane', day:'2-digit',month:'short',year:'numeric',hour:'numeric',minute:'2-digit',timeZoneName:'short'}).format(new Date(value));\nconst batches = [];\n// A conservative HTML-size limit leaves room for Matrix encryption overhead.\nlet chunk = [], size = 0;\nfunction flush() {\n  if (!chunk.length) return;\n  const records = chunk.flatMap(r => r.queries);\n  const times = records.map(q => Date.parse(q.queried_at));\n  const message = '<h3>AdGuard blocked requests</h3><p>' + time(Math.min(...times)) + ' \u2013 ' + time(Math.max(...times)) + '</p><p><strong>' + records.length + ' blocked requests \u00b7 ' + new Set(chunk.map(r=>r.domain)).size + ' domains \u00b7 ' + new Set(records.map(q=>q.client)).size + ' clients</strong></p><table><thead><tr><th>Domain</th><th>Client</th><th>Blocked requests</th></tr></thead><tbody>' + chunk.map(r=>'<tr><td>'+escape(r.domain)+'</td><td>'+escape(r.client)+'</td><td>'+r.queries.length+'</td></tr>').join('') + '</tbody></table>';\n  batches.push({json:{batch_id:'adguard-'+$execution.id+'-'+batches.length,message,query_ids:JSON.stringify(records.map(q=>q.query_id)),delivered:false,matrix_event_id:'',prepared_at:new Date().toISOString()}});\n  chunk=[];size=0;\n}\nfor (const row of rows) {\n  const length = (escape(row.domain).length+escape(row.client).length)*3+100;\n  if (size+length>12000 || chunk.length>=40) flush();\n  chunk.push(row);size+=length;\n}\nflush();\nreturn batches;\n"
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "2f7b7d01-fee8-4ea0-9d25-8fbdc73cde38",
+      "name": "Has new batches",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1200,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "eb627aeb-85a8-4518-98b1-137dc312d917",
+              "leftValue": "={{ $json.batch_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "5441e100-1cf8-4147-bae4-0f72f5f4c350",
+      "name": "Persist immutable batches",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1440,
+        0
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "value": "gQtwYFaDvtjVUHHj",
+          "mode": "list",
+          "cachedResultName": "AdGuard Matrix Notification Batches"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "schema": [
+            {
+              "id": "batch_id",
+              "displayName": "batch_id",
+              "type": "string",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "message",
+              "displayName": "message",
+              "type": "string",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "query_ids",
+              "displayName": "query_ids",
+              "type": "string",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "delivered",
+              "displayName": "delivered",
+              "type": "boolean",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "matrix_event_id",
+              "displayName": "matrix_event_id",
+              "type": "string",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "prepared_at",
+              "displayName": "prepared_at",
+              "type": "date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "37b8230f-c547-4180-aa54-4ae1ad0f01e5",
+      "name": "Read pending batches",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1680,
+        0
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "gQtwYFaDvtjVUHHj",
+          "mode": "list",
+          "cachedResultName": "AdGuard Matrix Notification Batches"
+        },
+        "returnAll": true,
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "delivered",
+              "condition": "eq",
+              "keyValue": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "wv07Z6jDBKWlgksk",
+          "mode": "list",
+          "cachedResultName": "Matrix Sender"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "message": "={{ $json.message }}",
+            "format": "html",
+            "encrypted": true,
+            "request_id": "={{ $json.batch_id }}"
+          },
+          "schema": [
+            {
+              "id": "message",
+              "displayName": "message",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "room_id",
+              "displayName": "room_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "format",
+              "displayName": "format",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "encrypted",
+              "displayName": "encrypted",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "request_id",
+              "displayName": "request_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "mode": "each",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "b93af02e-193f-4207-81c8-9b308b142cc7",
+      "name": "Send Matrix notification",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        1920,
+        0
+      ]
+    },
+    {
+      "id": "adc78466-4ad8-40e7-ae82-a39800b1858c",
+      "name": "Record successful delivery",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        2160,
+        0
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "value": "gQtwYFaDvtjVUHHj",
+          "mode": "list",
+          "cachedResultName": "AdGuard Matrix Notification Batches"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "delivered": true,
+            "matrix_event_id": "={{ $json.event_id }}"
+          },
+          "schema": [
+            {
+              "id": "batch_id",
+              "displayName": "batch_id",
+              "type": "string",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "message",
+              "displayName": "message",
+              "type": "string",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "query_ids",
+              "displayName": "query_ids",
+              "type": "string",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "delivered",
+              "displayName": "delivered",
+              "type": "boolean",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "matrix_event_id",
+              "displayName": "matrix_event_id",
+              "type": "string",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "prepared_at",
+              "displayName": "prepared_at",
+              "type": "date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {},
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "batch_id",
+              "condition": "eq",
+              "keyValue": "={{ $('Read pending batches').item.json.batch_id }}"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Notification request": {
+      "main": [
+        [
+          {
+            "node": "Prune delivered batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prune delivered batches": {
+      "main": [
+        [
+          {
+            "node": "Read blocked queries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read blocked queries": {
+      "main": [
+        [
+          {
+            "node": "Read notification batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read notification batches": {
+      "main": [
+        [
+          {
+            "node": "Prepare notification batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare notification batches": {
+      "main": [
+        [
+          {
+            "node": "Has new batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has new batches": {
+      "main": [
+        [
+          {
+            "node": "Persist immutable batches",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Read pending batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist immutable batches": {
+      "main": [
+        [
+          {
+            "node": "Read pending batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read pending batches": {
+      "main": [
+        [
+          {
+            "node": "Send Matrix notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Matrix notification": {
+      "main": [
+        [
+          {
+            "node": "Record successful delivery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Australia/Brisbane",
+    "errorWorkflow": "fOszDr3Us7EmONPm",
+    "executionTimeout": 600,
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "none",
+    "saveManualExecutions": false
+  }
+}
