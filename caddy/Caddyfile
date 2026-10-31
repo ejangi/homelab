@@ -46,6 +46,14 @@
         reverse_proxy sftpgo:8080
     }
 
+    handle /logs {
+        redir * /logs/ 302
+    }
+
+    handle /logs/* {
+        reverse_proxy grafana:3000
+    }
+
     handle {
         respond "Not found" 404
     }

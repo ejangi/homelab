@@ -106,3 +106,8 @@ BleepingComputer RSS feed every hour, records each delivered article in the
 `BleepingComputer Articles` n8n data table, and sends new articles through
 Matrix Sender. Each message links the title to the article and includes its
 categories and description.
+
+## Orbi syslog
+
+See [Orbi syslog receiver](docs/orbi-syslog.md) for the LAN TCP endpoint,
+UFW rules, retention, router verification commands, and Grafana search at `/logs/`.

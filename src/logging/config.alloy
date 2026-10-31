@@ -1,0 +1,28 @@
+local.file_match "orbi" {
+  path_targets = [
+    {"__path__" = "/var/log/orbi/orbi-rbr20.log", "job" = "orbi", "device" = "orbi-rbr20"},
+    {"__path__" = "/var/log/orbi/orbi-rbs20.log", "job" = "orbi", "device" = "orbi-rbs20"},
+  ]
+}
+loki.source.file "orbi" {
+  targets    = local.file_match.orbi.targets
+  forward_to = [loki.process.orbi.receiver]
+}
+loki.process "orbi" {
+  stage.regex {
+    expression = "^received=(?P<received>\\S+) sent=(?P<sent>\\S+) source=(?P<source>\\S+) host=(?P<host>\\S+) facility=(?P<facility>\\S+) severity=(?P<severity>\\S+) raw="
+  }
+  stage.timestamp {
+    source = "received"
+    format = "RFC3339"
+  }
+  stage.labels {
+    values = { host = "", facility = "", severity = "" }
+  }
+  forward_to = [loki.write.local.receiver]
+}
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

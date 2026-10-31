@@ -1,5 +1,5 @@
 services:
-  # 1. N8N SERVICE
+  # N8N SERVICE
   n8n:
     image: n8nio/n8n
     container_name: n8n
@@ -68,6 +68,78 @@ services:
       - TOKEN=
     networks:
       - n8n_backend
+
+  # CADDY SERVICE (Reverse Proxy & Automatic HTTPS)
+  caddy:
+    image: caddy:latest
+    container_name: n8n_caddy
+    restart: always
+    ports:
+      # Expose standard web ports
+      - "80:80"
+      - "443:443"
+      - "8080:8080"
+    volumes:
+      # CRITICAL: Mount the local Caddyfile into the container's config path
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Volume for Caddy's data (including SSL certificates)
+      - caddy_data:/data
+      # Trusted certificate issued by the local Tailscale client. The private
+      # key is deliberately ignored by Git and readable only by its owner.
+      - ./caddy/tailscale-certs:/etc/caddy/tailscale-certs:ro
+    depends_on:
+      - n8n
+      - matrix
+    networks:
+      - n8n_backend
+
+  # POSTGRES SERVICE
+  postgres:
+    image: postgres:15-alpine
+    container_name: n8n_postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # Note: We use $$ to escape the $ sign, allowing the shell to access the environment variable
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - n8n_backend
+
+  # POSTGRES BACKUP SERVICE
+  postgres_backup:
+    image: postgres:15-alpine # Use the same image to ensure compatibility with pg_dump
+    container_name: n8n_postgres_backup
+    restart: "no"
+    environment:
+      # Database Connection Details - Variables are set for n8n/postgres compatibility
+      - PGHOST=postgres
+      - PGPORT=5432
+      - PGDATABASE=${POSTGRES_DB}
+      - PGUSER=${POSTGRES_USER}
+      - PGPASSWORD=${POSTGRES_PASSWORD}
+      # Backup settings
+      - BACKUP_DIR=/backups
+    volumes:
+      # Mount a local directory for backups (bind mount)
+      - ./backups:/backups
+      # CRITICAL: Mount a script that performs the actual backup and scheduling
+      - ./scripts/backup.sh:/usr/local/bin/backup.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy # Ensure postgres is up and ready
+    networks:
+      - n8n_backend
+    command:
+      ["sh", "-c", "while true; do /usr/local/bin/backup.sh; sleep 86400; done"]
 
   # 2.5 MATRIX SERVICE
   matrix:
@@ -171,79 +243,61 @@ services:
     networks:
       - n8n_backend
 
-  # 2. POSTGRES SERVICE
-  postgres:
-    image: postgres:15-alpine
-    container_name: n8n_postgres
+  grafana:
+    image: grafana/grafana:13.3.0
     restart: unless-stopped
     environment:
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      GF_SERVER_ROOT_URL: https://${N8N_HOST}/logs/
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_DATE_FORMATS_DEFAULT_TIMEZONE: Australia/Brisbane
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      # Note: We use $$ to escape the $ sign, allowing the shell to access the environment variable
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
-    networks:
-      - n8n_backend
+      - grafana_data:/var/lib/grafana
+      - ./src/logging/grafana/provisioning:/etc/grafana/provisioning:ro
+    networks: [n8n_backend]
 
-  # 3. CADDY SERVICE (Reverse Proxy & Automatic HTTPS)
-  caddy:
-    image: caddy:latest
-    container_name: n8n_caddy
-    restart: always
-    ports:
-      # Expose standard web ports
-      - "80:80"
-      - "443:443"
-      - "8080:8080"
+  loki:
+    image: grafana/loki:3.7.9
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/config.yml"]
     volumes:
-      # CRITICAL: Mount the local Caddyfile into the container's config path
-      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
-      # Volume for Caddy's data (including SSL certificates)
-      - caddy_data:/data
-      # Trusted certificate issued by the local Tailscale client. The private
-      # key is deliberately ignored by Git and readable only by its owner.
-      - ./caddy/tailscale-certs:/etc/caddy/tailscale-certs:ro
-    depends_on:
-      - n8n
-      - matrix
-    networks:
-      - n8n_backend
+      - ./src/logging/loki.yml:/etc/loki/config.yml:ro
+      - loki_data:/loki
+    networks: [n8n_backend]
 
-  # 4. POSTGRES BACKUP SERVICE
-  postgres_backup:
-    image: postgres:15-alpine # Use the same image to ensure compatibility with pg_dump
-    container_name: n8n_postgres_backup
-    restart: "no"
+  alloy:
+    image: grafana/alloy:v1.21.3
+    restart: unless-stopped
+    # Router log files are root-owned, mode 0640; mount them read-only.
+    user: "0:0"
+    command: ["run", "--storage.path=/var/lib/alloy", "/etc/alloy/config.alloy"]
+    volumes:
+      - ./src/logging/config.alloy:/etc/alloy/config.alloy:ro
+      - ./logs/orbi:/var/log/orbi:ro
+      - alloy_data:/var/lib/alloy
+    networks: [n8n_backend]
+
+  syslog-ng:
+    build: ./src/syslog-ng
+    restart: unless-stopped
+    # Host networking keeps UFW INPUT rules effective (no Docker port DNAT).
+    network_mode: host
     environment:
-      # Database Connection Details - Variables are set for n8n/postgres compatibility
-      - PGHOST=postgres
-      - PGPORT=5432
-      - PGDATABASE=${POSTGRES_DB}
-      - PGUSER=${POSTGRES_USER}
-      - PGPASSWORD=${POSTGRES_PASSWORD}
-      # Backup settings
-      - BACKUP_DIR=/backups
+      SYSLOG_LAN_IP: ${SYSLOG_LAN_IP:?Set SYSLOG_LAN_IP in .env}
+      TZ: Australia/Brisbane
     volumes:
-      # Mount a local directory for backups (bind mount)
-      - ./backups:/backups
-      # CRITICAL: Mount a script that performs the actual backup and scheduling
-      - ./scripts/backup.sh:/usr/local/bin/backup.sh:ro
-    depends_on:
-      postgres:
-        condition: service_healthy # Ensure postgres is up and ready
-    networks:
-      - n8n_backend
-    command:
-      ["sh", "-c", "while true; do /usr/local/bin/backup.sh; sleep 86400; done"]
+      - ./logs/orbi:/var/log/orbi
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-  # 5. SFTPGO SERVICE
+  # SFTPGO SERVICE
   # SFTPGo provides the web file UI at /files and stores its configuration in
   # the existing PostgreSQL database. A table prefix keeps its tables isolated
   # from n8n while retaining the existing nightly PostgreSQL backup coverage.
@@ -286,7 +340,7 @@ services:
     networks:
       - n8n_backend
 
-  # 6. SAMBA SERVICE
+  # SAMBA SERVICE
   # Apple Files connects to SMB shares directly, whereas SFTPGo's /files route
   # is a browser UI. This exposes the same iCloud Drive bind mount as an
   # authenticated SMB share without making it available anonymously.
@@ -310,6 +364,9 @@ services:
 
 # Volume & Network Definition
 volumes:
+  grafana_data:
+  loki_data:
+  alloy_data:
   n8n_data:
   postgres_data:
   caddy_data: # Define the new Caddy data volume

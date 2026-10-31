@@ -1,0 +1,14 @@
+/var/log/orbi/*.log {
+    daily
+    maxsize 20M
+    rotate 14
+    maxage 14
+    missingok
+    notifempty
+    compress
+    create 0640 root root
+    sharedscripts
+    postrotate
+        syslog-ng-ctl reopen
+    endscript
+}
