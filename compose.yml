@@ -1,7 +1,7 @@
 services:
   # N8N SERVICE
   n8n:
-    image: n8nio/n8n
+    image: n8nio/n8n:2.45.7
     container_name: n8n
     restart: unless-stopped
     sysctls:
@@ -58,7 +58,7 @@ services:
   # pages that publish their download metadata only after client-side rendering.
   # n8n calls it over the existing backend network; no browser port is exposed.
   browserless:
-    image: ghcr.io/browserless/chromium:latest
+    image: ghcr.io/browserless/chromium:v2.58.1
     container_name: n8n_browserless
     restart: unless-stopped
     environment:
@@ -71,7 +71,7 @@ services:
 
   # CADDY SERVICE (Reverse Proxy & Automatic HTTPS)
   caddy:
-    image: caddy:latest
+    image: caddy:2.11.7
     container_name: n8n_caddy
     restart: always
     ports:
@@ -95,7 +95,7 @@ services:
 
   # POSTGRES SERVICE
   postgres:
-    image: postgres:15-alpine
+    image: postgres:15.19-alpine
     container_name: n8n_postgres
     restart: unless-stopped
     environment:
@@ -116,9 +116,9 @@ services:
 
   # POSTGRES BACKUP SERVICE
   postgres_backup:
-    image: postgres:15-alpine # Use the same image to ensure compatibility with pg_dump
+    image: postgres:15.19-alpine # Use the same image to ensure compatibility with pg_dump
     container_name: n8n_postgres_backup
-    restart: "no"
+    restart: unless-stopped
     environment:
       # Database Connection Details - Variables are set for n8n/postgres compatibility
       - PGHOST=postgres
@@ -183,7 +183,7 @@ services:
       context: .
       dockerfile: src/matrix-backup/Dockerfile
     container_name: n8n_matrix_store_backup
-    restart: "no"
+    restart: unless-stopped
     environment:
       - MATRIX_STORE_DIR=/matrix-store
       - BACKUP_DIR=/backups
@@ -302,7 +302,7 @@ services:
   # the existing PostgreSQL database. A table prefix keeps its tables isolated
   # from n8n while retaining the existing nightly PostgreSQL backup coverage.
   sftpgo:
-    image: drakkan/sftpgo:v2.7.1-alpine
+    image: drakkan/sftpgo:v2.7.6-alpine
     container_name: sftpgo
     restart: unless-stopped
     environment:

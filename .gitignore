@@ -7,3 +7,6 @@ src/matrix/target/
 caddy/tailscale-certs/
 
 logs/orbi/
+
+# Private recovery snapshots include environment secrets.
+backups/pre-upgrade-*/
