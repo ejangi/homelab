@@ -15,6 +15,9 @@ assert.match(out[0].json.message,/<td>3<\/td><td>1<\/td>/);
 assert.equal(JSON.parse(out[0].json.query_ids).length,4);
 assert.equal(run(queries,out.map(i=>i.json)).length,0); // pending and delivered batches both reserve IDs
 assert.equal(run([]).length,0);
+assert.equal(run([q('new','1','Laptop')],out.map(i=>i.json)).length,0); // an outage cannot accumulate more reports
+assert.equal(run([q('new','1','Laptop')],out.map(i=>({...i.json,delivered:true}))).length,1);
 assert.equal(run([queries[0],queries[0]])[0].json.message.includes('1 blocked requests'),true);
-assert.equal(run(Array.from({length:81},(_,i)=>q(String(i),'1','Laptop',i+'.example.com'))).length,3);
+assert.equal(run(Array.from({length:81},(_,i)=>q(String(i),'1','Laptop',i+'.example.com'))).length,2);
+assert.equal(run(Array.from({length:41},(_,i)=>q(String(i),'1','Laptop',i+'.example.com'))).length,1);
 console.log('AdGuard notification grouping, escaping, duplicate suppression, empty runs and splitting passed');

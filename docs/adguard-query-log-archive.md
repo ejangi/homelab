@@ -78,8 +78,8 @@ notifications can be retried. The child sends nothing when no blocked queries
 are awaiting delivery. It groups requests by normalized domain and client
 address, displaying the client name or its address when unnamed. The HTML table
 shows domain, client, and blocked-request count, sorted by descending count.
-Reporting timestamps use Australia/Brisbane. Tables split at 40 rows or a
-conservative message-size threshold; each part reports its own totals.
+Reporting timestamps use Australia/Brisbane. Table reads run once per invocation
+to avoid repeating the same query for each incoming item. Tables split only at a conservative message-size threshold; each part reports its own totals.
 
 The **AdGuard Matrix Notification Batches** data table (`gQtwYFaDvtjVUHHj`)
 is an outbox with `batch_id` (string), `message` (string), `query_ids` (string
@@ -89,6 +89,9 @@ repeat notifications from the overlapping collection window. Immutable batches
 are inserted before delivery; the Matrix Sender uses `batch_id` as its request
 ID. A batch is marked delivered only after the sender succeeds. A failure after
 Matrix accepts a message therefore retries the same payload and idempotency key.
+While any batch is pending, no new batches are prepared. New queries remain
+in the archive; after recovery they are grouped into the following run’s report,
+so an outage does not build a queue of separate 15-minute notifications.
 Delivered batches are pruned after eight days, beyond query retention; pending
 batches remain available for retry. The table stores DNS notification content
 and is covered by the existing Postgres backups. Do not run concurrent parent

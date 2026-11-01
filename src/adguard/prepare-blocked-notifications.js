@@ -1,4 +1,7 @@
 // Persist these immutable batches before delivery so retries reuse the same payload.
+// Keep one outstanding report during an outage. Do not build a queue of
+// immutable messages that would all be released together on recovery.
+if ($('Read notification batches').all().some(({json}) => json.batch_id && json.delivered !== true)) return [];
 const known = new Set();
 for (const {json: batch} of $('Read notification batches').all()) {
   for (const id of JSON.parse(batch.query_ids || '[]')) known.add(id);
@@ -30,7 +33,7 @@ function flush() {
 }
 for (const row of rows) {
   const length = (escape(row.domain).length+escape(row.client).length)*3+100;
-  if (size+length>12000 || chunk.length>=40) flush();
+  if (size+length>12000) flush();
   chunk.push(row);size+=length;
 }
 flush();

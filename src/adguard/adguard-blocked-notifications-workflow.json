@@ -49,7 +49,8 @@
           ]
         }
       },
-      "alwaysOutputData": true
+      "alwaysOutputData": true,
+      "executeOnce": true
     },
     {
       "id": "2e07b953-1398-4821-b17c-88d3ac270c21",
@@ -85,7 +86,8 @@
           ]
         }
       },
-      "alwaysOutputData": true
+      "alwaysOutputData": true,
+      "executeOnce": true
     },
     {
       "id": "3fa81bf2-c066-43ee-a361-ea892b4cafe4",
@@ -107,7 +109,8 @@
         },
         "returnAll": true
       },
-      "alwaysOutputData": true
+      "alwaysOutputData": true,
+      "executeOnce": true
     },
     {
       "id": "8789eaad-4a3f-43cd-a270-a5fd48425b61",
@@ -119,7 +122,7 @@
         0
       ],
       "parameters": {
-        "jsCode": "// Persist these immutable batches before delivery so retries reuse the same payload.\nconst known = new Set();\nfor (const {json: batch} of $('Read notification batches').all()) {\n  for (const id of JSON.parse(batch.query_ids || '[]')) known.add(id);\n}\nconst queries = $('Read blocked queries').all().map(i => i.json)\n  .filter(q => q.query_id && q.blocked === true && !known.has(q.query_id));\nconst groups = new Map();\nfor (const q of queries) {\n  if (known.has(q.query_id)) continue;\n  known.add(q.query_id);\n  const domain = q.domain.toLowerCase().replace(/\\.$/, '');\n  const key = JSON.stringify([domain, q.client]);\n  if (!groups.has(key)) groups.set(key, {domain, client: q.client_name?.trim() || q.client, queries: []});\n  groups.get(key).queries.push(q);\n}\nconst rows = [...groups.values()].sort((a,b) => b.queries.length-a.queries.length || a.domain.localeCompare(b.domain) || a.client.localeCompare(b.client));\nconst escape = s => String(s).replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));\nconst time = value => new Intl.DateTimeFormat('en-AU', {timeZone:'Australia/Brisbane', day:'2-digit',month:'short',year:'numeric',hour:'numeric',minute:'2-digit',timeZoneName:'short'}).format(new Date(value));\nconst batches = [];\n// A conservative HTML-size limit leaves room for Matrix encryption overhead.\nlet chunk = [], size = 0;\nfunction flush() {\n  if (!chunk.length) return;\n  const records = chunk.flatMap(r => r.queries);\n  const times = records.map(q => Date.parse(q.queried_at));\n  const message = '<h3>AdGuard blocked requests</h3><p>' + time(Math.min(...times)) + ' \u2013 ' + time(Math.max(...times)) + '</p><p><strong>' + records.length + ' blocked requests \u00b7 ' + new Set(chunk.map(r=>r.domain)).size + ' domains \u00b7 ' + new Set(records.map(q=>q.client)).size + ' clients</strong></p><table><thead><tr><th>Domain</th><th>Client</th><th>Blocked requests</th></tr></thead><tbody>' + chunk.map(r=>'<tr><td>'+escape(r.domain)+'</td><td>'+escape(r.client)+'</td><td>'+r.queries.length+'</td></tr>').join('') + '</tbody></table>';\n  batches.push({json:{batch_id:'adguard-'+$execution.id+'-'+batches.length,message,query_ids:JSON.stringify(records.map(q=>q.query_id)),delivered:false,matrix_event_id:'',prepared_at:new Date().toISOString()}});\n  chunk=[];size=0;\n}\nfor (const row of rows) {\n  const length = (escape(row.domain).length+escape(row.client).length)*3+100;\n  if (size+length>12000 || chunk.length>=40) flush();\n  chunk.push(row);size+=length;\n}\nflush();\nreturn batches;\n"
+        "jsCode": "// Persist these immutable batches before delivery so retries reuse the same payload.\n// Keep one outstanding report during an outage. Do not build a queue of\n// immutable messages that would all be released together on recovery.\nif ($('Read notification batches').all().some(({json}) => json.batch_id && json.delivered !== true)) return [];\nconst known = new Set();\nfor (const {json: batch} of $('Read notification batches').all()) {\n  for (const id of JSON.parse(batch.query_ids || '[]')) known.add(id);\n}\nconst queries = $('Read blocked queries').all().map(i => i.json)\n  .filter(q => q.query_id && q.blocked === true && !known.has(q.query_id));\nconst groups = new Map();\nfor (const q of queries) {\n  if (known.has(q.query_id)) continue;\n  known.add(q.query_id);\n  const domain = q.domain.toLowerCase().replace(/\\.$/, '');\n  const key = JSON.stringify([domain, q.client]);\n  if (!groups.has(key)) groups.set(key, {domain, client: q.client_name?.trim() || q.client, queries: []});\n  groups.get(key).queries.push(q);\n}\nconst rows = [...groups.values()].sort((a,b) => b.queries.length-a.queries.length || a.domain.localeCompare(b.domain) || a.client.localeCompare(b.client));\nconst escape = s => String(s).replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));\nconst time = value => new Intl.DateTimeFormat('en-AU', {timeZone:'Australia/Brisbane', day:'2-digit',month:'short',year:'numeric',hour:'numeric',minute:'2-digit',timeZoneName:'short'}).format(new Date(value));\nconst batches = [];\n// A conservative HTML-size limit leaves room for Matrix encryption overhead.\nlet chunk = [], size = 0;\nfunction flush() {\n  if (!chunk.length) return;\n  const records = chunk.flatMap(r => r.queries);\n  const times = records.map(q => Date.parse(q.queried_at));\n  const message = '<h3>AdGuard blocked requests</h3><p>' + time(Math.min(...times)) + ' \u2013 ' + time(Math.max(...times)) + '</p><p><strong>' + records.length + ' blocked requests \u00b7 ' + new Set(chunk.map(r=>r.domain)).size + ' domains \u00b7 ' + new Set(records.map(q=>q.client)).size + ' clients</strong></p><table><thead><tr><th>Domain</th><th>Client</th><th>Blocked requests</th></tr></thead><tbody>' + chunk.map(r=>'<tr><td>'+escape(r.domain)+'</td><td>'+escape(r.client)+'</td><td>'+r.queries.length+'</td></tr>').join('') + '</tbody></table>';\n  batches.push({json:{batch_id:'adguard-'+$execution.id+'-'+batches.length,message,query_ids:JSON.stringify(records.map(q=>q.query_id)),delivered:false,matrix_event_id:'',prepared_at:new Date().toISOString()}});\n  chunk=[];size=0;\n}\nfor (const row of rows) {\n  const length = (escape(row.domain).length+escape(row.client).length)*3+100;\n  if (size+length>12000) flush();\n  chunk.push(row);size+=length;\n}\nflush();\nreturn batches;\n"
       },
       "alwaysOutputData": true
     },
@@ -266,7 +269,8 @@
             }
           ]
         }
-      }
+      },
+      "executeOnce": true
     },
     {
       "parameters": {
