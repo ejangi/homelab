@@ -1203,6 +1203,7 @@ fn is_allowed_image_host(host: Option<&str>) -> bool {
         host,
         Some("cdn.shopify.com")
             | Some("images.puma.com")
+            | Some("static.theiconic.com.au")
             | Some("res.cloudinary.com")
             | Some("i.gr-assets.com")
     )
@@ -1501,6 +1502,7 @@ mod tests {
     fn public_image_hosts_are_explicitly_allowlisted() {
         assert!(is_allowed_image_host(Some("cdn.shopify.com")));
         assert!(is_allowed_image_host(Some("images.puma.com")));
+        assert!(is_allowed_image_host(Some("static.theiconic.com.au")));
         assert!(is_allowed_image_host(Some("res.cloudinary.com")));
         assert!(is_allowed_image_host(Some("i.gr-assets.com")));
         assert!(!is_allowed_image_host(Some("proton.me")));

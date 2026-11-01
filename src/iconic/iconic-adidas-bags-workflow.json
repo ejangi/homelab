@@ -1,0 +1,423 @@
+{
+  "name": "THE ICONIC adidas crossbody and messenger bags",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      },
+      "id": "d5893331-f1f3-4eb6-a973-6ca69b875c3a",
+      "name": "Every day at 7 AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1160,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "e59bc6c2-3e2e-480b-a00d-8a1f5afa11ab",
+      "name": "Run on demand",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1160,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://browserless:3000/function",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "{\"code\": \"export default async function ({ page }) {\\n  const products = new Map();\\n  for (let number = 1; number <= 20; number++) {\\n    const response = await page.goto(`https://www.theiconic.com.au/mens-accessories-bags/?q=adidas&sort=new&page=${number}`, { waitUntil: 'networkidle2', timeout: 55000 });\\n    if (!response.ok()) throw new Error(`THE ICONIC returned HTTP ${response.status()}`);\\n    const result = await page.evaluate(() => {\\n      const html = document.documentElement.outerHTML;\\n      if (!document.querySelector('#catalogProductsList') || !document.querySelector('#sort-newarrivals:checked')) throw new Error('Missing catalogue or newest-first sort');\\n      let metadata;\\n      for (const script of document.scripts) {\\n        for (const match of script.textContent.matchAll(/dl\\\\.push\\\\((\\\\{[^\\\\n]+\\\\})\\\\);/g)) {\\n          try { const data = JSON.parse(match[1]); if (data.event === 'ti.data.products' && data.eventData?.list === 'catalog') metadata = data.products; } catch {}\\n        }\\n      }\\n      if (!metadata) throw new Error('Missing product metadata');\\n      const found = [];\\n      for (const tile of document.querySelectorAll('#catalogProductsList [data-ti-track-product]')) {\\n        const id = tile.getAttribute('data-ti-track-product');\\n        const product = metadata[id];\\n        if (!product) throw new Error(`Missing metadata for ${id}`);\\n        if (!/\\\\badidas\\\\b/i.test(product.brand) || !['male', 'unisex'].includes(product.gender)) continue;\\n        if (!/cross[ -]?body|messenger|shoulder/i.test(`${product.category} ${product.name}`)) continue;\\n        const link = tile.querySelector('a.product-image-link');\\n        const image = tile.querySelector('.image-frame img');\\n        const price = product.price.final;\\n        if (!link || !image || !price || !Number.isFinite(Number(price))) throw new Error(`Incomplete product ${id}`);\\n        const imageUrl = decodeURIComponent(image.getAttribute('data-src') || image.src).match(/https:\\\\/\\\\/static\\\\.theiconic\\\\.com\\\\.au\\\\/p\\\\/[^?]+/)?.[0] || '';\\n        if (!imageUrl.startsWith('https://static.theiconic.com.au/p/')) throw new Error('Unexpected image host');\\n        found.push({product_id:id,title:product.name,brand:product.brand,price:`A$${Number(price).toFixed(2)} AUD`,product_url:link.href,image_url:imageUrl});\\n      }\\n      const next = [...document.querySelectorAll('a[href]')].some(a => { const u = new URL(a.href); return u.pathname === location.pathname && Number(u.searchParams.get('page')) === Number(new URL(location.href).searchParams.get('page')) + 1; });\\n      return { products: found, next };\\n    });\\n    for (const product of result.products) products.set(product.product_id, product);\\n    if (!result.next) return { data: { products: [...products.values()], pages: number }, type: 'application/json' };\\n  }\\n  throw new Error('Pagination exceeded 20 pages');\\n}\\n\"}",
+        "options": {
+          "timeout": 90000
+        }
+      },
+      "id": "3d19bed4-9eae-49b9-b415-10b55627e3f8",
+      "name": "Search THE ICONIC with Browserless",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        -920,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const products = $json.data?.products ?? $json.products;\nif (!Array.isArray(products)) throw new Error('Missing ICONIC products array');\nconst escape = s => String(s).replace(/([\\\\`*_{}[\\]<>])/g, '\\\\$1');\nconst preview = $('Preview one bag').isExecuted || ($('Run on demand').isExecuted && $('Run on demand').first().json.preview === true);\nreturn (preview ? products.slice(0,1) : products).map(p => ({json:{...p,first_seen_at:new Date().toISOString(),image_alt:p.title,matrix_request_id:`iconic-adidas-${p.product_id}`,message:[preview ? '\ud83d\udc5c **adidas bag alert \u2014 preview**' : '\ud83d\udc5c **New adidas bag at THE ICONIC**','',`**${escape(p.title)}**`,escape(p.brand),`**Price:** ${p.price}`,'',`[View product at THE ICONIC](${p.product_url})`].join('\\n')}}));"
+      },
+      "id": "b5a36a74-1cf3-47e6-b54b-12a47cf2d975",
+      "name": "Prepare adidas bag alerts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -680,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "rowNotExists",
+        "dataTableId": {
+          "__rl": true,
+          "value": "ap8xzBdbUkiMgmx5",
+          "mode": "list",
+          "cachedResultName": "THE ICONIC adidas bags"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "product_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.product_id }}"
+            }
+          ]
+        }
+      },
+      "id": "f19430cd-7cd8-485b-837f-bdfea0e1b040",
+      "name": "Only undelivered adidas bags",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        -420,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "wv07Z6jDBKWlgksk",
+          "mode": "list",
+          "cachedResultName": "Matrix Sender"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "message": "={{ $json.message }}",
+            "format": "markdown",
+            "encrypted": true,
+            "request_id": "={{ $json.matrix_request_id }}",
+            "image_url": "={{ $json.image_url }}",
+            "image_alt": "={{ $json.image_alt }}"
+          },
+          "schema": [
+            {
+              "id": "message",
+              "displayName": "message",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "room_id",
+              "displayName": "room_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "format",
+              "displayName": "format",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "encrypted",
+              "displayName": "encrypted",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "request_id",
+              "displayName": "request_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "image_url",
+              "displayName": "image_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "image_alt",
+              "displayName": "image_alt",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "mode": "each",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "098501a0-f85b-49c4-b2bf-0ea949c1e3ba",
+      "name": "Send Matrix notification",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        360,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const product = $('Only undelivered adidas bags').item.json; if (!$json.event_id) throw new Error('Matrix delivery missing event ID'); return {json: {product_id: product.product_id, title: product.title, brand: product.brand, price: product.price, product_url: product.product_url, image_url: product.image_url, first_seen_at: product.first_seen_at, matrix_event_id: $json.event_id}};"
+      },
+      "id": "a415dd6a-643d-4737-a397-e9153a292345",
+      "name": "Prepare delivered bag record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        620,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "value": "ap8xzBdbUkiMgmx5",
+          "mode": "list",
+          "cachedResultName": "THE ICONIC adidas bags"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "schema": [
+            {
+              "id": "product_id",
+              "displayName": "product_id",
+              "type": "string",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "title",
+              "displayName": "title",
+              "type": "string",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "brand",
+              "displayName": "brand",
+              "type": "string",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "price",
+              "displayName": "price",
+              "type": "string",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "product_url",
+              "displayName": "product_url",
+              "type": "string",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "image_url",
+              "displayName": "image_url",
+              "type": "string",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "first_seen_at",
+              "displayName": "first_seen_at",
+              "type": "date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "matrix_event_id",
+              "displayName": "matrix_event_id",
+              "type": "string",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "bc3d07d3-824d-4c7d-8a6b-f292497e565c",
+      "name": "Record delivered adidas bag",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        880,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "6ef64a8f-066c-4626-9acb-151fa9fdc438",
+      "name": "Preview one bag",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1160,
+        360
+      ]
+    }
+  ],
+  "connections": {
+    "Every day at 7 AM": {
+      "main": [
+        [
+          {
+            "node": "Search THE ICONIC with Browserless",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run on demand": {
+      "main": [
+        [
+          {
+            "node": "Search THE ICONIC with Browserless",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search THE ICONIC with Browserless": {
+      "main": [
+        [
+          {
+            "node": "Prepare adidas bag alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare adidas bag alerts": {
+      "main": [
+        [
+          {
+            "node": "Only undelivered adidas bags",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Only undelivered adidas bags": {
+      "main": [
+        [
+          {
+            "node": "Send Matrix notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Matrix notification": {
+      "main": [
+        [
+          {
+            "node": "Prepare delivered bag record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare delivered bag record": {
+      "main": [
+        [
+          {
+            "node": "Record delivered adidas bag",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preview one bag": {
+      "main": [
+        [
+          {
+            "node": "Search THE ICONIC with Browserless",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Australia/Brisbane",
+    "errorWorkflow": "fOszDr3Us7EmONPm",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all"
+  },
+  "id": "okhvmp8GJvco8Eb4"
+}

@@ -111,3 +111,5 @@ categories and description.
 
 See [Orbi syslog receiver](docs/orbi-syslog.md) for the LAN TCP endpoint,
 UFW rules, retention, router verification commands, and Grafana search at `/logs/`.
+
+THE ICONIC adidas crossbody and messenger alerts: [setup and behavior](docs/iconic-adidas-bags.md).
