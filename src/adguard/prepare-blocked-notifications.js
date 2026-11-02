@@ -1,3 +1,7 @@
+// Domains match themselves and subdomains, case-insensitively.
+const excludedDomains = $('Notification filters').first().json.excluded_domains
+  .map(domain => domain.trim().toLowerCase().replace(/\.$/, '')).filter(Boolean);
+const excluded = domain => excludedDomains.some(filter => domain === filter || domain.endsWith('.' + filter));
 // Persist these immutable batches before delivery so retries reuse the same payload.
 // Keep one outstanding report during an outage. Do not build a queue of
 // immutable messages that would all be released together on recovery.
@@ -13,6 +17,7 @@ for (const q of queries) {
   if (known.has(q.query_id)) continue;
   known.add(q.query_id);
   const domain = q.domain.toLowerCase().replace(/\.$/, '');
+  if (excluded(domain)) continue;
   const key = JSON.stringify([domain, q.client]);
   if (!groups.has(key)) groups.set(key, {domain, client: q.client_name?.trim() || q.client, queries: []});
   groups.get(key).queries.push(q);

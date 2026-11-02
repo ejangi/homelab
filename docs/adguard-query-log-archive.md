@@ -117,3 +117,15 @@ address fallback, duplicate suppression, empty runs, and message splitting.
 Live verification sent a labelled fictional-client preview through the child,
 confirmed a single delivered outbox batch, and reran it without another delivery.
 The temporary webhook workflows and seeded query records were removed.
+
+### Notification exclusions
+
+Edit `excluded_domains` in the child workflow's **Notification filters** Code
+node to add domains (initially `snapkit.com`). Each entry suppresses that domain
+and its subdomains, case-insensitively, from newly prepared Matrix batches.
+Matching respects domain boundaries: `notsnapkit.com` is not excluded.
+An empty list disables exclusions. DNS blocking and archived query records are
+unaffected. Removing an exclusion makes retained, previously unreported queries
+eligible again. Existing immutable pending batches retain their original payload
+for safe idempotent retries. Keep the checked-in workflow JSON synchronized when
+editing the live list.
