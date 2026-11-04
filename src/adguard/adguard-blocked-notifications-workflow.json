@@ -455,7 +455,7 @@
         0
       ],
       "parameters": {
-        "jsCode": "// Add domains here to suppress them and their subdomains from new Matrix reports.\nreturn [{json: {excluded_domains: ['snapkit.com']}}];"
+        "jsCode": "// Add domains here to suppress them and their subdomains from new Matrix reports.\nreturn [{json: {excluded_domains: ['snapkit.com', 'sc-static.net']}}];"
       }
     }
   ],

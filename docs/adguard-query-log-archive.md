@@ -121,7 +121,7 @@ The temporary webhook workflows and seeded query records were removed.
 ### Notification exclusions
 
 Edit `excluded_domains` in the child workflow's **Notification filters** Code
-node to add domains (initially `snapkit.com`). Each entry suppresses that domain
+node to add domains (`snapkit.com` and `sc-static.net`). Each entry suppresses that domain
 and its subdomains, case-insensitively, from newly prepared Matrix batches.
 Matching respects domain boundaries: `notsnapkit.com` is not excluded.
 An empty list disables exclusions. DNS blocking and archived query records are
