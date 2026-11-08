@@ -22,62 +22,27 @@ See the [Matrix notifications service and workflow specification](docs/specs/mat
 for setup, configuration, caller inputs, encryption behaviour, and recovery
 requirements.
 
-## SFTPGo iCloud Drive
+## Nextcloud iCloud Drive
 
-The Compose stack includes [SFTPGo](https://docs.sftpgo.com/) for web-based
-access to `/home/ejangi/iCloud Drive`. It is available at
-`https://<N8N_HOST>/files`; set `ICLOUD_DRIVE_DIR` in `.env` only if that
-directory is elsewhere.
+Open https://ejangi-nix.bobtail-morpho.ts.net/cloud/ with Tailscale connected.
+Sign in as `admin` using `NEXTCLOUD_ADMIN_PASSWORD` in the local `.env`.
+Caddy uses the existing Tailscale HTTPS certificate.
 
-Before its first start, add a strong, unique SFTPGo administrator password to
-`.env`:
+The existing `ICLOUD_DRIVE_DIR` (default `/home/ejangi/iCloud Drive`) is
+mounted at `/mnt/icloud` as local external storage named **iCloud Drive**.
+It is separate from Nextcloud's internal `nextcloud_data` volume. Never remove
+that host directory when retiring containers. SFTPGo and Samba are retired;
+their old database tables remain available for recovery.
 
-```bash
-SFTPGO_ADMIN_PASSWORD=<generate-a-strong-password>
-```
+Nextcloud uses `oc_` tables in the existing Postgres database, covered by the
+existing nightly dump. Also back up the `nextcloud_data` volume (configuration,
+apps and internal files) and the external iCloud Drive directory; the database
+dump alone cannot restore files. The cron service runs background jobs.
 
-Start it with:
-
-```bash
-docker compose up -d sftpgo
-```
-
-Sign in at `/files/web/admin`, create a regular SFTPGo user with home directory
-`/srv/sftpgo/data`, then use that account at `/files/web/client` to manage the
-iCloud Drive files. The SFTP server itself is disabled in this web-only setup.
-
-SFTPGo stores its configuration, users, shares, and audit data in the existing
-Postgres database using an `sftpgo_` table prefix. Its data is therefore already
-included in the existing nightly PostgreSQL dump; no extra database service or
-backup process is needed.
-
-## iPhone Files (SMB)
-
-The stack also exposes the same directory as the authenticated SMB share
-`iCloudDrive`. This is separate from the HTTPS web UI: `/files` is only for a
-browser, while the iPhone Files app connects to:
-
-```
-smb://<N8N_HOST>/iCloudDrive
-```
-
-Add a strong, unique password to `.env` before starting the share:
-
-```bash
-SMB_PASSWORD=<generate-a-strong-password>
-```
-
-Then run:
-
-```bash
-docker compose up -d samba
-```
-
-In **Files** on iPhone, choose **Browse** → **More** → **Connect to Server**,
-enter the SMB address above, choose **Registered User**, and enter username
-`files` with the `SMB_PASSWORD` value. Keep the Tailscale VPN connected when
-away from the home network. SMB is exposed on TCP port 445 and does not use
-Caddy or the `/files` URL.
+The custom image maps www-data to host UID/GID 1000, preserving existing file
+ownership. Rebuild both Nextcloud services together on upgrades. External file
+changes are checked on access; a full rescan can be run when needed with
+`docker compose exec -u www-data nextcloud php occ files:scan --all`.
 
 ## AdGuard DNS query logs
 
